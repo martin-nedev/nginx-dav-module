@@ -1,0 +1,5 @@
+
+#!/bin/sh
+ngx_addon_dir=`pwd`
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_dav_module.c"
+exit 0
