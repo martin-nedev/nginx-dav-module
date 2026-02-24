@@ -3,6 +3,7 @@
 #include <ngx_http.h>
 
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
+static void ngx_http_dav_put_body_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
 
 typedef struct {
@@ -13,6 +14,11 @@ typedef struct {
     ngx_uint_t    methods_mask;
     ngx_array_t  *parsed_access;
 } ngx_http_dav_loc_conf_t;
+
+typedef struct {
+    ngx_flag_t   done;
+    ngx_int_t    status;
+} ngx_http_dav_ctx_t;
 
 static void *ngx_http_dav_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
@@ -80,6 +86,14 @@ ngx_http_dav_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
+    ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (ctx && ctx->done) {
+        ngx_log_error(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                      "dav: finishing request with status=%i", ctx->status);
+        ngx_http_finalize_request(r, ctx->status);
+        return NGX_DONE;
+    }
+
     if (r->method == NGX_HTTP_PUT) {
         bit = 0x01;
     } else if (r->method == NGX_HTTP_DELETE) {
@@ -95,36 +109,218 @@ ngx_http_dav_handler(ngx_http_request_t *r)
     }
 
     if ((dlcf->methods_mask & bit) == 0) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "dav: method not allowed, methods_mask=%ui method=\"%V\"",
+                      dlcf->methods_mask, &r->method_name);
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    ngx_str_t    resp = ngx_string("dav: method allowed\n");
-    ngx_buf_t   *b;
-    ngx_chain_t  out;
+    ngx_log_error(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                  "dav: method allowed, methods_mask=%ui method=\"%V\"",
+                  dlcf->methods_mask, &r->method_name);
 
-    r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_length_n = resp.len;
-    r->headers_out.content_type.len = sizeof("text/plain") - 1;
-    r->headers_out.content_type.data = (u_char *)"text/plain";
+    if (r->method == NGX_HTTP_PUT) {
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            ctx->done = 0;
+            ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
 
-    ngx_int_t rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        return rc;
+        ngx_int_t rc = ngx_http_read_client_request_body(r, ngx_http_dav_put_body_handler);
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rc;
+        }
+        return NGX_DONE;
     }
 
-    b = ngx_create_temp_buf(r->pool, resp.len);
-    if (b == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return NGX_DECLINED;
+}
+
+static void
+ngx_http_dav_put_body_handler(ngx_http_request_t *r)
+{
+    ngx_http_dav_loc_conf_t  *dlcf;
+    ngx_str_t                 path;
+    u_char                   *last;
+    ngx_fd_t                  fd;
+    ngx_file_t                file;
+    ssize_t                   n;
+
+    dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
+    if (dlcf == NULL) {
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
     }
 
-    ngx_memcpy(b->pos, resp.data, resp.len);
-    b->last = b->pos + resp.len;
-    b->last_buf = 1;
+    size_t root_len;
+    last = ngx_http_map_uri_to_path(r, &path, &root_len, 0);
+    if (last == NULL) {
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
+    }
 
-    out.buf = b;
-    out.next = NULL;
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "dav: mapped path \"%V\"", &path);
 
-    return ngx_http_output_filter(r, &out);
+    if (dlcf->create_full_path) {
+        u_char *p = path.data + path.len - 1;
+        while (p > path.data && *p != '/') {
+            p--;
+        }
+
+        if (p > path.data) {
+            u_char saved = *p;
+            *p = '\0';
+            if (ngx_create_full_path(path.data, 0700) == NGX_FILE_ERROR) {
+                *p = saved;
+                ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+                if (ctx == NULL) {
+                    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+                    if (ctx == NULL) {
+                        return;
+                    }
+                    ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+                }
+                ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+                ctx->done = 1;
+                r->write_event_handler = ngx_http_core_run_phases;
+                ngx_http_core_run_phases(r);
+                return;
+            }
+            *p = saved;
+        }
+    }
+
+    /* create temp filename = path + ".tmp" */
+    ngx_str_t tmp;
+    tmp.len = path.len + sizeof(".tmp") - 1;
+    tmp.data = ngx_pnalloc(r->pool, tmp.len + 1);
+    if (tmp.data == NULL) {
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
+    }
+    ngx_snprintf(tmp.data, tmp.len + 1, "%V.tmp", &path);
+
+    ngx_log_error(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "dav: creating temp file \"%s\"", tmp.data);
+    fd = ngx_open_file(tmp.data, NGX_FILE_WRONLY, NGX_FILE_TRUNCATE, 0644);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: cannot create temp file \"%s\"", tmp.data);
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
+    }
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.fd = fd;
+    file.name.data = tmp.data;
+    file.name.len = tmp.len;
+    file.log = r->connection->log;
+    file.offset = 0;
+
+    n = ngx_write_chain_to_file(&file, r->request_body->bufs, 0, r->pool);
+    if (n == NGX_ERROR) {
+        ngx_close_file(fd);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: write to temp file failed");
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "dav: wrote %z bytes to temp file", n);
+
+    ngx_close_file(fd);
+
+    if (ngx_rename_file(tmp.data, path.data) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: rename \"%s\" to \"%V\" failed", tmp.data, &path);
+        ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+        if (ctx == NULL) {
+            ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+            if (ctx == NULL) {
+                return;
+            }
+            ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+        }
+        ctx->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ctx->done = 1;
+        r->write_event_handler = ngx_http_core_run_phases;
+        ngx_http_core_run_phases(r);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "dav: renamed \"%s\" -> \"%V\"", tmp.data, &path);
+
+    ngx_http_dav_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+        if (ctx == NULL) {
+            return;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+    }
+
+    ctx->status = NGX_HTTP_CREATED;
+    ctx->done = 1;
+    r->write_event_handler = ngx_http_core_run_phases;
+    ngx_http_core_run_phases(r);
+    return;
 }
 
 static ngx_int_t
