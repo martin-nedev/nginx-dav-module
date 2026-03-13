@@ -522,7 +522,7 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    /* ensure parent exists */
+    /* ensure parent exists (or create it when requested) */
     {
         u_char *p = path.data + path.len - 1;
         while (p > path.data && *p != '/') p--;
@@ -530,21 +530,32 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
             return NGX_HTTP_FORBIDDEN;
         }
 
-        char parent[PATH_MAX];
-        size_t plen = p - path.data;
-        if (plen >= sizeof(parent)) plen = sizeof(parent) - 1;
-        ngx_memcpy(parent, path.data, plen);
-        parent[plen] = '\0';
-
-        if (ngx_file_info(parent, &sb) == NGX_FILE_ERROR) {
-            if (ngx_errno == ENOENT) {
-                return NGX_HTTP_CONFLICT; /* parent doesn't exist */
+        if (dlcf->create_full_path) {
+            /* create parent path components if needed */
+            u_char saved = *p;
+            *p = '\0';
+            if (ngx_create_full_path(path.data, 0755) == NGX_FILE_ERROR) {
+                *p = saved;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            *p = saved;
+        } else {
+            char parent[PATH_MAX];
+            size_t plen = p - path.data;
+            if (plen >= sizeof(parent)) plen = sizeof(parent) - 1;
+            ngx_memcpy(parent, path.data, plen);
+            parent[plen] = '\0';
+
+            if (ngx_file_info(parent, &sb) == NGX_FILE_ERROR) {
+                if (ngx_errno == ENOENT) {
+                    return NGX_HTTP_CONFLICT; /* parent doesn't exist */
+                }
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
         }
     }
 
-    /* create directory */
+    /* create directory (final component) */
     if (mkdir((char *) path.data, 0755) == 0) {
         return NGX_HTTP_CREATED;
     }
