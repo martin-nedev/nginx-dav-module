@@ -7,12 +7,20 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <dirent.h>
+#include <utime.h>
+#include <stdio.h>
 
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
 static void ngx_http_dav_put_body_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_delete_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_mkcol_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_dav_move_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
+static ngx_int_t ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char *dst);
+static ngx_int_t ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst);
+static ngx_int_t ngx_http_dav_remove_tree(ngx_http_request_t *r, const char *path);
+static ngx_int_t ngx_http_dav_unlink_if_unchanged(ngx_http_request_t *r, const char *path, const ngx_file_info_t *orig_st);
 
 typedef struct {
         ngx_flag_t    create_full_path;
@@ -240,6 +248,9 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 
     if (r->method_name.len == 5 && ngx_strncasecmp(r->method_name.data, (u_char *)"MKCOL", 5) == 0) {
         return ngx_http_dav_mkcol_handler(r);
+    }
+    if (r->method_name.len == 4 && ngx_strncasecmp(r->method_name.data, (u_char *)"MOVE", 4) == 0) {
+        return ngx_http_dav_move_handler(r);
     }
 
     return NGX_DECLINED;
@@ -486,6 +497,7 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
     ngx_str_t                 path;
     u_char                   *last;
 
+
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
     if (dlcf == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -571,6 +583,583 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
     }
 
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
+}
+
+static ngx_int_t
+ngx_http_dav_move_handler(ngx_http_request_t *r)
+{
+    ngx_http_dav_loc_conf_t  *dlcf;
+    ngx_str_t src, dst, dest_hdr = ngx_null_string;
+    u_char *last;
+    ngx_uint_t overwrite = 1;
+
+    dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
+    if (dlcf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* find Destination and Overwrite headers */
+    {
+        ngx_list_part_t *part = &r->headers_in.headers.part;
+        ngx_table_elt_t *h = part->elts;
+        ngx_uint_t i = 0;
+        for ( ;; ) {
+            if (i >= part->nelts) {
+                if (part->next == NULL) break;
+                part = part->next; h = part->elts; i = 0;
+            }
+            if (h[i].key.len == 11 && ngx_strncasecmp(h[i].key.data, (u_char *)"Destination", 11) == 0) {
+                dest_hdr = h[i].value;
+            }
+            if (h[i].key.len == 9 && ngx_strncasecmp(h[i].key.data, (u_char *)"Overwrite", 9) == 0) {
+                if (h[i].value.len && (h[i].value.data[0] == 'F' || h[i].value.data[0] == 'f')) {
+                    overwrite = 0;
+                }
+            }
+            i++;
+        }
+    }
+
+    if (dest_hdr.len == 0) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    /* map source URI to filesystem path */
+    size_t root_len;
+    last = ngx_http_map_uri_to_path(r, &src, &root_len, 0);
+    if (last == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* derive destination URI (strip scheme/host if present), percent-decode
+     * and normalize duplicate slashes before mapping to filesystem */
+    /* don't log Destination header contents in normal operation */
+    {
+        u_char *start = dest_hdr.data;
+        u_char *end = dest_hdr.data + dest_hdr.len;
+        u_char *path_start = NULL;
+
+        /* If Destination is an absolute URI (scheme://authority/path)
+         * find the first '/' after the authority. Support network-path
+         * references that start with '//' as well. */
+        u_char *scheme = (u_char *) ngx_strnstr(start, "://", dest_hdr.len);
+        if (scheme) {
+            u_char *after = scheme + 3;
+            path_start = ngx_strlchr(after, end, '/');
+            if (path_start == NULL) {
+                return NGX_HTTP_BAD_REQUEST;
+            }
+        } else if (dest_hdr.len >= 2 && start[0] == '/' && start[1] == '/') {
+            /* network-path reference: skip '//' and authority */
+            path_start = ngx_strlchr(start + 2, end, '/');
+            if (path_start == NULL) return NGX_HTTP_BAD_REQUEST;
+        } else if (dest_hdr.len >= 1 && start[0] == '/') {
+            /* absolute-path */
+            path_start = start;
+        } else {
+            /* fallback: find first '/' anywhere */
+            path_start = ngx_strlchr(start, end, '/');
+            if (path_start == NULL) return NGX_HTTP_BAD_REQUEST;
+        }
+
+        /* percent-decode into pool-allocated buffer */
+        size_t raw_len = (size_t)(end - path_start);
+        u_char *raw = ngx_pnalloc(r->pool, raw_len + 1);
+        if (raw == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_memcpy(raw, path_start, raw_len);
+        raw[raw_len] = '\0';
+
+        u_char *dec = ngx_pnalloc(r->pool, raw_len + 1);
+        if (dec == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+        /* simple percent-decode */
+        size_t di = 0;
+        for (size_t ri = 0; ri < raw_len; ri++) {
+            u_char c = raw[ri];
+            if (c == '%' && ri + 2 < raw_len) {
+                u_char hi = raw[ri+1];
+                u_char lo = raw[ri+2];
+                int vhi = -1, vlo = -1;
+                if (hi >= '0' && hi <= '9') vhi = hi - '0';
+                else if (hi >= 'A' && hi <= 'F') vhi = hi - 'A' + 10;
+                else if (hi >= 'a' && hi <= 'f') vhi = hi - 'a' + 10;
+                if (lo >= '0' && lo <= '9') vlo = lo - '0';
+                else if (lo >= 'A' && lo <= 'F') vlo = lo - 'A' + 10;
+                else if (lo >= 'a' && lo <= 'f') vlo = lo - 'a' + 10;
+
+                if (vhi >= 0 && vlo >= 0) {
+                    dec[di++] = (u_char) ((vhi << 4) | vlo);
+                    ri += 2;
+                    continue;
+                }
+            }
+            dec[di++] = c;
+        }
+        dec[di] = '\0';
+
+        /* normalize duplicate slashes (collapse '//' to '/') */
+        u_char *norm = ngx_pnalloc(r->pool, di + 1);
+        if (norm == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        size_t ni = 0;
+        for (size_t i = 0; i < di; i++) {
+            if (dec[i] == '/' && i + 1 < di && dec[i+1] == '/') continue;
+            norm[ni++] = dec[i];
+        }
+        norm[ni] = '\0';
+
+        ngx_str_t dest_uri;
+        dest_uri.data = norm;
+        dest_uri.len = ni;
+
+        if (dest_uri.len == 0 || dest_uri.data[0] != '/') {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        /* reject path traversal attempts ("..") and backslashes */
+        {
+            size_t pos = 0;
+            while (pos < dest_uri.len) {
+                if (dest_uri.data[pos] == '/') { pos++; continue; }
+                size_t seg_start = pos;
+                while (pos < dest_uri.len && dest_uri.data[pos] != '/') pos++;
+                size_t seg_len = pos - seg_start;
+                if (seg_len == 2 && dest_uri.data[seg_start] == '.' && dest_uri.data[seg_start+1] == '.') {
+                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "dav: dest contains '..' segment, rejecting");
+                    return NGX_HTTP_FORBIDDEN;
+                }
+                for (size_t i = seg_start; i < seg_start + seg_len; i++) {
+                    if (dest_uri.data[i] == '\\') {
+                        return NGX_HTTP_BAD_REQUEST;
+                    }
+                }
+            }
+        }
+
+        /* dest_uri mapping is intentionally not logged at debug level */
+
+        /* temporarily set r->uri to destination and map it */
+        ngx_str_t old_uri = r->uri;
+        r->uri = dest_uri;
+        last = ngx_http_map_uri_to_path(r, &dst, &root_len, 0);
+        r->uri = old_uri;
+        if (last == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+        /* mapped dst intentionally not logged to avoid noisy output */
+    }
+
+    /* enforce dav_access if configured (both src and dst) */
+    if (dlcf->parsed_access) {
+        ngx_keyval_t *kvs = dlcf->parsed_access->elts; ngx_uint_t i; ngx_flag_t ok = 0;
+        for (i = 0; i < dlcf->parsed_access->nelts; i++) {
+            if (src.len >= kvs[i].key.len && ngx_memcmp(src.data, kvs[i].key.data, kvs[i].key.len) == 0) { ok = 1; break; }
+        }
+        if (!ok) return NGX_HTTP_FORBIDDEN;
+        ok = 0;
+        for (i = 0; i < dlcf->parsed_access->nelts; i++) {
+            if (dst.len >= kvs[i].key.len && ngx_memcmp(dst.data, kvs[i].key.data, kvs[i].key.len) == 0) { ok = 1; break; }
+        }
+        if (!ok) return NGX_HTTP_FORBIDDEN;
+    }
+
+    /* destination existence */
+    ngx_file_info_t fi;
+    ngx_flag_t dest_exists = (ngx_file_info((char *) dst.data, &fi) == 0);
+    if (dest_exists && !overwrite) return NGX_HTTP_PRECONDITION_FAILED;
+    ngx_ext_rename_file_t ext;
+    ext.access = 0;
+    ext.path_access = 0;
+    ext.time = -1;
+    ext.create_path = 0; /* parent ensured earlier */
+    ext.delete_file = 0; /* do not delete source on failure */
+    ext.log = r->connection->log;
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                  "dav: MOVE attempt src='%V' dst='%V' overwrite=%d",
+                  &src, &dst, (int) overwrite);
+
+    if (ngx_ext_rename_file(&src, &dst, &ext) != NGX_OK) {
+        /* cross-device link? try copy+unlink fallback */
+        if (ngx_errno == EXDEV) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "dav: rename EXDEV, attempting copy fallback src='%V' dst='%V'",
+                          &src, &dst);
+
+            /* open source without following symlinks to mitigate TOCTOU */
+            int infd = open((char *) src.data, O_RDONLY | O_NOFOLLOW);
+            if (infd == -1) {
+                if (ngx_errno == ENOENT) return NGX_HTTP_NOT_FOUND;
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            ngx_file_info_t sst;
+            if (ngx_file_info((char *) src.data, &sst) == NGX_FILE_ERROR) {
+                close(infd);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* handle directory copy recursively */
+            if (S_ISDIR(sst.st_mode)) {
+                if (ngx_http_dav_copy_dir(r, (char *) src.data, (char *) dst.data) != NGX_OK) {
+                    close(infd);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                close(infd);
+                if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                return dest_exists ? NGX_HTTP_NO_CONTENT : NGX_HTTP_CREATED;
+            }
+
+            /* create a temp file in the destination directory for atomic replace */
+            size_t tpl_len = dst.len + sizeof(".davXXXXXX") + 1;
+            char *tmp_path = ngx_pnalloc(r->pool, tpl_len);
+            if (tmp_path == NULL) { close(infd); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            /* copy dst path and append template */
+            ngx_memcpy(tmp_path, dst.data, dst.len);
+            ngx_memcpy(tmp_path + dst.len, ".davXXXXXX", sizeof(".davXXXXXX"));
+            tmp_path[dst.len + sizeof(".davXXXXXX") - 1] = '\0';
+
+            int outfd = mkstemp(tmp_path);
+            if (outfd == -1) {
+                close(infd);
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* set mode on temp file */
+            if (fchmod(outfd, sst.st_mode & 0777) == -1) {
+                close(infd); close(outfd); ngx_delete_file(tmp_path);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            ssize_t nread;
+            char buf[8192];
+            while ((nread = read(infd, buf, sizeof(buf))) > 0) {
+                char *p = buf;
+                ssize_t nw;
+                ssize_t towrite = nread;
+                while (towrite > 0) {
+                    nw = write(outfd, p, towrite);
+                    if (nw <= 0) break;
+                    towrite -= nw; p += nw;
+                }
+                if (nw <= 0) break;
+            }
+
+            if (nread < 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                              "dav: copy fallback failed src='%V' dst='%V'", &src, &dst);
+                close(infd); close(outfd); ngx_delete_file(tmp_path);
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* ensure data flushed */
+            fsync(outfd);
+            close(outfd);
+            close(infd);
+
+            /* atomic rename temp -> dst */
+            if (rename(tmp_path, (char *) dst.data) != 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                              "dav: rename(temp->dst) failed src='%V' dst='%V'", &src, &dst);
+                ngx_delete_file(tmp_path);
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* verify source unchanged (avoid unlinking a different file) */
+            {
+                struct stat sb2;
+                if (lstat((char *) src.data, &sb2) == -1) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "dav: lstat(src) failed after copy '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                if (sb2.st_ino != sst.st_ino || sb2.st_dev != sst.st_dev) {
+                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                  "dav: src changed during copy; refusing to unlink '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                /* prefer unlinking via parent dir fd to avoid races */
+                if (ngx_http_dav_unlink_if_unchanged(r, (char *) src.data, &sst) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "dav: copy succeeded but unlink(src) failed '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+            }
+
+            return dest_exists ? NGX_HTTP_NO_CONTENT : NGX_HTTP_CREATED;
+        }
+
+        /* if destination exists and overwrite requested, try remove dst then retry */
+        if (ngx_errno == EEXIST && dest_exists && overwrite) {
+            /* perform atomic replace: copy src -> temp in dst dir, rename temp->dst */
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "dav: atomic replace dst '%V' to honor Overwrite=T", &dst);
+
+            int infd = open((char *) src.data, O_RDONLY | O_NOFOLLOW);
+            if (infd == -1) {
+                if (ngx_errno == ENOENT) return NGX_HTTP_NOT_FOUND;
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            ngx_file_info_t sst;
+            if (fstat(infd, &sst) == -1) { close(infd); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            if (S_ISLNK(sst.st_mode)) { close(infd); return NGX_HTTP_FORBIDDEN; }
+
+            size_t tpl_len = dst.len + sizeof(".davXXXXXX") + 1;
+            char *tmp_path = ngx_pnalloc(r->pool, tpl_len);
+            if (tmp_path == NULL) { close(infd); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            ngx_memcpy(tmp_path, dst.data, dst.len);
+            ngx_memcpy(tmp_path + dst.len, ".davXXXXXX", sizeof(".davXXXXXX"));
+            tmp_path[dst.len + sizeof(".davXXXXXX") - 1] = '\0';
+
+            int outfd = mkstemp(tmp_path);
+            if (outfd == -1) { close(infd); if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN; return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            if (fchmod(outfd, sst.st_mode & 0777) == -1) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+
+            ssize_t nread;
+            char buf[8192];
+            while ((nread = read(infd, buf, sizeof(buf))) > 0) {
+                char *p = buf; ssize_t nw; ssize_t towrite = nread;
+                while (towrite > 0) {
+                    nw = write(outfd, p, towrite);
+                    if (nw <= 0) break;
+                    towrite -= nw; p += nw;
+                }
+                if (nw <= 0) break;
+            }
+            if (nread < 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            fsync(outfd); close(outfd); close(infd);
+
+            if (rename(tmp_path, (char *) dst.data) != 0) {
+                ngx_delete_file(tmp_path);
+                if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* verify source unchanged before unlinking */
+            {
+                struct stat sb2;
+                if (lstat((char *) src.data, &sb2) == -1) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "dav: lstat(src) failed after atomic replace '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                if (sb2.st_ino != sst.st_ino || sb2.st_dev != sst.st_dev) {
+                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                  "dav: src changed during atomic replace; refusing to unlink '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                if (ngx_http_dav_unlink_if_unchanged(r, (char *) src.data, &sst) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "dav: atomic replace succeeded but unlink(src) failed '%V'", &src);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+            }
+
+            return NGX_HTTP_NO_CONTENT;
+        }
+
+        /* map common errno to HTTP */
+        if (ngx_errno == ENOENT) return NGX_HTTP_NOT_FOUND;
+        if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN;
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "dav: MOVE success src='%V' dst='%V'", &src, &dst);
+    return dest_exists ? NGX_HTTP_NO_CONTENT : NGX_HTTP_CREATED;
+}
+
+/* Copy a regular file from src -> dst atomically using a temp file in dst's directory. */
+static ngx_int_t
+ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char *dst)
+{
+    int infd = open(src, O_RDONLY | O_NOFOLLOW);
+    if (infd == -1) {
+        return NGX_ERROR;
+    }
+
+    struct stat st;
+    if (fstat(infd, &st) == -1) { close(infd); return NGX_ERROR; }
+    if (S_ISLNK(st.st_mode)) { close(infd); return NGX_ERROR; }
+
+    size_t dstlen = ngx_strlen(dst);
+    size_t tpl_len = dstlen + sizeof(".davXXXXXX") + 1;
+    char *tmp_path = ngx_pnalloc(r->pool, tpl_len);
+    if (tmp_path == NULL) { close(infd); return NGX_ERROR; }
+    ngx_memcpy(tmp_path, dst, dstlen);
+    ngx_memcpy(tmp_path + dstlen, ".davXXXXXX", sizeof(".davXXXXXX"));
+    tmp_path[dstlen + sizeof(".davXXXXXX") - 1] = '\0';
+
+    int outfd = mkstemp(tmp_path);
+    if (outfd == -1) { close(infd); return NGX_ERROR; }
+    if (fchmod(outfd, st.st_mode & 0777) == -1) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+
+    ssize_t nread;
+    char buf[8192];
+    while ((nread = read(infd, buf, sizeof(buf))) > 0) {
+        ssize_t towrite = nread;
+        char *p = buf;
+        while (towrite > 0) {
+            ssize_t nw = write(outfd, p, towrite);
+            if (nw <= 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+            towrite -= nw; p += nw;
+        }
+    }
+
+    if (nread < 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+
+    fsync(outfd);
+    close(outfd);
+    close(infd);
+
+    if (rename(tmp_path, dst) != 0) { ngx_delete_file(tmp_path); return NGX_ERROR; }
+
+    /* preserve timestamps */
+    struct utimbuf times;
+    times.actime = st.st_atime;
+    times.modtime = st.st_mtime;
+    utime(dst, &times);
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst)
+{
+    DIR *d = opendir(src);
+    if (d == NULL) return NGX_ERROR;
+
+    struct stat st;
+    if (stat(src, &st) == -1) { closedir(d); return NGX_ERROR; }
+    if (mkdir(dst, st.st_mode & 0777) == -1) {
+        if (errno != EEXIST) { closedir(d); return NGX_ERROR; }
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ngx_strcmp(ent->d_name, ".") == 0 || ngx_strcmp(ent->d_name, "..") == 0) continue;
+        size_t slen = strlen(src);
+        size_t dlen = strlen(dst);
+        size_t entry_len = slen + 1 + strlen(ent->d_name) + 1;
+        char *src_entry = ngx_pnalloc(r->pool, entry_len);
+        if (src_entry == NULL) { closedir(d); return NGX_ERROR; }
+        ngx_snprintf((u_char *) src_entry, entry_len, "%s/%s", src, ent->d_name);
+
+        size_t dst_entry_len = dlen + 1 + strlen(ent->d_name) + 1;
+        char *dst_entry = ngx_pnalloc(r->pool, dst_entry_len);
+        if (dst_entry == NULL) { closedir(d); return NGX_ERROR; }
+        ngx_snprintf((u_char *) dst_entry, dst_entry_len, "%s/%s", dst, ent->d_name);
+
+        struct stat est;
+        if (lstat(src_entry, &est) == -1) { closedir(d); return NGX_ERROR; }
+        if (S_ISLNK(est.st_mode)) { closedir(d); return NGX_ERROR; }
+        if (S_ISDIR(est.st_mode)) {
+            if (ngx_http_dav_copy_dir(r, src_entry, dst_entry) != NGX_OK) { closedir(d); return NGX_ERROR; }
+        } else if (S_ISREG(est.st_mode)) {
+            if (ngx_http_dav_copy_file_atomic(r, src_entry, dst_entry) != NGX_OK) { closedir(d); return NGX_ERROR; }
+        } else {
+            /* skip special files */
+        }
+    }
+
+    closedir(d);
+
+    /* preserve directory times */
+    struct utimbuf times;
+    times.actime = st.st_atime;
+    times.modtime = st.st_mtime;
+    utime(dst, &times);
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_remove_tree(ngx_http_request_t *r, const char *path)
+{
+    DIR *d = opendir(path);
+    if (d == NULL) return NGX_ERROR;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ngx_strcmp(ent->d_name, ".") == 0 || ngx_strcmp(ent->d_name, "..") == 0) continue;
+        size_t plen = strlen(path);
+        size_t elen = strlen(ent->d_name);
+        size_t buf_len = plen + 1 + elen + 1;
+        char *p = ngx_pnalloc(r->pool, buf_len);
+        if (p == NULL) { closedir(d); return NGX_ERROR; }
+        ngx_snprintf((u_char *) p, buf_len, "%s/%s", path, ent->d_name);
+
+        struct stat st;
+        if (lstat(p, &st) == -1) { closedir(d); return NGX_ERROR; }
+        if (S_ISDIR(st.st_mode)) {
+            if (ngx_http_dav_remove_tree(r, p) != NGX_OK) { closedir(d); return NGX_ERROR; }
+            if (rmdir(p) == -1) { closedir(d); return NGX_ERROR; }
+        } else {
+            if (unlink(p) == -1) { closedir(d); return NGX_ERROR; }
+        }
+    }
+
+    closedir(d);
+    return NGX_OK;
+}
+
+/* Unlink path only if it still refers to the original inode/dev. Uses parent dir fd + unlinkat. */
+static ngx_int_t
+ngx_http_dav_unlink_if_unchanged(ngx_http_request_t *r, const char *path, const ngx_file_info_t *orig_st)
+{
+    const char *slash = strrchr(path, '/');
+    const char *name;
+    char *parent = NULL;
+    int dfd = -1;
+
+    if (slash == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (slash == path) {
+        /* parent is root */
+        parent = (char *)"/";
+        name = slash + 1;
+    } else {
+        size_t plen = (size_t)(slash - path);
+        parent = ngx_pnalloc(r->pool, plen + 1);
+        if (parent == NULL) return NGX_ERROR;
+        ngx_memcpy(parent, path, plen);
+        parent[plen] = '\0';
+        name = slash + 1;
+    }
+
+    dfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd == -1) {
+        return NGX_ERROR;
+    }
+
+    struct stat sb;
+    if (fstatat(dfd, name, &sb, AT_SYMLINK_NOFOLLOW) == -1) {
+        close(dfd);
+        return NGX_ERROR;
+    }
+
+    if (sb.st_ino != orig_st->st_ino || sb.st_dev != orig_st->st_dev) {
+        close(dfd);
+        return NGX_ERROR;
+    }
+
+    int flags = 0;
+    if (S_ISDIR(orig_st->st_mode)) flags = AT_REMOVEDIR;
+
+    if (unlinkat(dfd, name, flags) == -1) {
+        close(dfd);
+        return NGX_ERROR;
+    }
+
+    close(dfd);
+    return NGX_OK;
 }
 
 static void *
