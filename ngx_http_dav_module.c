@@ -14,10 +14,14 @@
 
 extern ngx_module_t ngx_http_dav_module;
 
+typedef struct ngx_http_dav_propfind_req_s ngx_http_dav_propfind_req_t;
+
 static ngx_int_t ngx_http_dav_handler(ngx_http_request_t *r);
 static void ngx_http_dav_put_body_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_delete_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_mkcol_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_dav_propfind_handler(ngx_http_request_t *r);
+static void ngx_http_dav_propfind_body_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_copy_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_move_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
@@ -25,6 +29,34 @@ static ngx_int_t ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char
 static ngx_int_t ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst);
 static ngx_int_t ngx_http_dav_remove_tree(ngx_http_request_t *r, const char *path);
 static ngx_int_t ngx_http_dav_unlink_if_unchanged(ngx_http_request_t *r, const char *path, const ngx_file_info_t *orig_st);
+static ngx_str_t ngx_http_dav_xml_escape(ngx_pool_t *pool, const u_char *src, size_t len);
+static ngx_int_t ngx_http_dav_chain_append(ngx_http_request_t *r, ngx_chain_t ***ll,
+    off_t *total, const u_char *data, size_t len);
+static ngx_int_t ngx_http_dav_propfind_collect_body(ngx_http_request_t *r, ngx_str_t *body);
+static ngx_int_t ngx_http_dav_propfind_parse_body(const u_char *data, size_t len,
+    ngx_http_dav_propfind_req_t *preq);
+static ngx_int_t ngx_http_dav_propfind_append_unknown_propstat(ngx_http_request_t *r,
+    ngx_chain_t ***ll, off_t *total, ngx_http_dav_propfind_req_t *preq);
+
+#define NGX_DAV_PROPFIND_ALLPROP  0
+#define NGX_DAV_PROPFIND_PROPNAME 1
+#define NGX_DAV_PROPFIND_PROP     2
+
+#define NGX_DAV_PROP_DISPLAYNAME      0x01
+#define NGX_DAV_PROP_RESOURCETYPE     0x02
+#define NGX_DAV_PROP_GETCONTENTLENGTH 0x04
+#define NGX_DAV_PROP_GETLASTMODIFIED  0x08
+#define NGX_DAV_PROP_ALL_KNOWN (NGX_DAV_PROP_DISPLAYNAME | NGX_DAV_PROP_RESOURCETYPE \
+    | NGX_DAV_PROP_GETCONTENTLENGTH | NGX_DAV_PROP_GETLASTMODIFIED)
+
+#define NGX_DAV_PROPFIND_UNKNOWN_MAX 32
+
+struct ngx_http_dav_propfind_req_s {
+    ngx_uint_t mode;
+    ngx_uint_t props_mask;
+    ngx_uint_t unknown_n;
+    ngx_str_t  unknown[NGX_DAV_PROPFIND_UNKNOWN_MAX];
+};
 
 typedef struct {
         ngx_flag_t    create_full_path;
@@ -39,6 +71,7 @@ typedef struct {
 typedef struct {
     ngx_flag_t   done;
     ngx_int_t    status;
+    ngx_flag_t   propfind_body_attempted;
 } ngx_http_dav_ctx_t;
 
 static void *ngx_http_dav_create_loc_conf(ngx_conf_t *cf);
@@ -246,6 +279,595 @@ ngx_http_dav_remove_tree_fd(ngx_http_request_t *r, int dirfd)
     return NGX_OK;
 }
 
+static ngx_str_t
+ngx_http_dav_xml_escape(ngx_pool_t *pool, const u_char *src, size_t len)
+{
+    ngx_str_t out;
+    out.data = NULL;
+    out.len = 0;
+
+    size_t i, extra = 0;
+    for (i = 0; i < len; i++) {
+        switch (src[i]) {
+            case '&': extra += sizeof("amp;") - 1; break;
+            case '<': extra += sizeof("lt;") - 1; break;
+            case '>': extra += sizeof("gt;") - 1; break;
+            case '"': extra += sizeof("quot;") - 1; break;
+            case '\'': extra += sizeof("apos;") - 1; break;
+            default: break;
+        }
+    }
+
+    out.data = ngx_pnalloc(pool, len + extra + 1);
+    if (out.data == NULL) {
+        return out;
+    }
+
+    u_char *p = out.data;
+    for (i = 0; i < len; i++) {
+        switch (src[i]) {
+            case '&':
+                p = ngx_cpymem(p, "&amp;", sizeof("&amp;") - 1);
+                break;
+            case '<':
+                p = ngx_cpymem(p, "&lt;", sizeof("&lt;") - 1);
+                break;
+            case '>':
+                p = ngx_cpymem(p, "&gt;", sizeof("&gt;") - 1);
+                break;
+            case '"':
+                p = ngx_cpymem(p, "&quot;", sizeof("&quot;") - 1);
+                break;
+            case '\'':
+                p = ngx_cpymem(p, "&apos;", sizeof("&apos;") - 1);
+                break;
+            default:
+                *p++ = src[i];
+                break;
+        }
+    }
+
+    *p = '\0';
+    out.len = p - out.data;
+    return out;
+}
+
+static ngx_int_t
+ngx_http_dav_chain_append(ngx_http_request_t *r, ngx_chain_t ***ll,
+    off_t *total, const u_char *data, size_t len)
+{
+    if (len == 0) {
+        return NGX_OK;
+    }
+
+    u_char *p = ngx_pnalloc(r->pool, len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(p, data, len);
+
+    ngx_buf_t *b = ngx_calloc_buf(r->pool);
+    if (b == NULL) {
+        return NGX_ERROR;
+    }
+
+    b->pos = p;
+    b->last = p + len;
+    b->start = p;
+    b->end = p + len;
+    b->memory = 1;
+
+    ngx_chain_t *cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl->buf = b;
+    cl->next = NULL;
+
+    **ll = cl;
+    *ll = &cl->next;
+    *total += (off_t) len;
+
+    return NGX_OK;
+}
+
+static ngx_flag_t
+ngx_http_dav_tag_name_char(u_char c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9') || c == '_' || c == '-'
+        || c == ':' || c == '.')
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+static ngx_flag_t
+ngx_http_dav_lname_eq(const u_char *name, size_t len, const char *lit)
+{
+    size_t i;
+    size_t llen = ngx_strlen(lit);
+
+    if (len != llen) {
+        return 0;
+    }
+
+    for (i = 0; i < len; i++) {
+        u_char a = name[i];
+        u_char b = (u_char) lit[i];
+
+        if (a >= 'A' && a <= 'Z') {
+            a = (u_char) (a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (u_char) (b - 'A' + 'a');
+        }
+
+        if (a != b) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static ngx_int_t
+ngx_http_dav_propfind_parse_body(const u_char *data, size_t len,
+    ngx_http_dav_propfind_req_t *preq)
+{
+    size_t i = 0;
+    ngx_flag_t seen_propfind = 0;
+    ngx_flag_t seen_allprop = 0;
+    ngx_flag_t seen_propname = 0;
+    ngx_flag_t seen_prop = 0;
+    ngx_uint_t props_mask = 0;
+    ngx_uint_t prop_depth = 0;
+
+    while (i < len) {
+        if (data[i] != '<') {
+            i++;
+            continue;
+        }
+
+        i++;
+        if (i >= len) {
+            break;
+        }
+
+        if (data[i] == '?') {
+            i++;
+            while (i + 1 < len) {
+                if (data[i] == '?' && data[i + 1] == '>') {
+                    i += 2;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+
+        if (data[i] == '!') {
+            if (i + 2 < len && data[i + 1] == '-' && data[i + 2] == '-') {
+                i += 3;
+                while (i + 2 < len) {
+                    if (data[i] == '-' && data[i + 1] == '-' && data[i + 2] == '>') {
+                        i += 3;
+                        break;
+                    }
+                    i++;
+                }
+            } else {
+                while (i < len && data[i] != '>') {
+                    i++;
+                }
+                if (i < len) {
+                    i++;
+                }
+            }
+            continue;
+        }
+
+        ngx_flag_t closing = 0;
+        if (data[i] == '/') {
+            closing = 1;
+            i++;
+        }
+
+        while (i < len && (data[i] == ' ' || data[i] == '\t'
+               || data[i] == '\r' || data[i] == '\n'))
+        {
+            i++;
+        }
+
+        size_t name_start = i;
+        while (i < len && ngx_http_dav_tag_name_char(data[i])) {
+            i++;
+        }
+
+        if (i == name_start) {
+            while (i < len && data[i] != '>') {
+                i++;
+            }
+            if (i < len) {
+                i++;
+            }
+            continue;
+        }
+
+        size_t lname_start = name_start;
+        size_t j;
+        for (j = name_start; j < i; j++) {
+            if (data[j] == ':') {
+                lname_start = j + 1;
+            }
+        }
+
+        size_t lname_len = i - lname_start;
+
+        ngx_flag_t self_closing = 0;
+        size_t k = i;
+        while (k < len && data[k] != '>') {
+            if (data[k] == '/') {
+                size_t t = k + 1;
+                while (t < len && (data[t] == ' ' || data[t] == '\t'
+                       || data[t] == '\r' || data[t] == '\n'))
+                {
+                    t++;
+                }
+                if (t < len && data[t] == '>') {
+                    self_closing = 1;
+                }
+            }
+            k++;
+        }
+
+        if (k < len) {
+            i = k + 1;
+        } else {
+            i = len;
+        }
+
+        if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "propfind")) {
+            if (!closing) {
+                seen_propfind = 1;
+            }
+            continue;
+        }
+
+        if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "allprop")) {
+            if (!closing) {
+                seen_allprop = 1;
+            }
+            continue;
+        }
+
+        if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "propname")) {
+            if (!closing) {
+                seen_propname = 1;
+            }
+            continue;
+        }
+
+        if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "prop")) {
+            if (closing) {
+                if (prop_depth > 0) {
+                    prop_depth--;
+                }
+            } else {
+                prop_depth++;
+                seen_prop = 1;
+                if (self_closing && prop_depth > 0) {
+                    prop_depth--;
+                }
+            }
+            continue;
+        }
+
+        if (!closing && prop_depth > 0) {
+            if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "displayname")) {
+                props_mask |= NGX_DAV_PROP_DISPLAYNAME;
+            } else if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "resourcetype")) {
+                props_mask |= NGX_DAV_PROP_RESOURCETYPE;
+            } else if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "getcontentlength")) {
+                props_mask |= NGX_DAV_PROP_GETCONTENTLENGTH;
+            } else if (ngx_http_dav_lname_eq(data + lname_start, lname_len, "getlastmodified")) {
+                props_mask |= NGX_DAV_PROP_GETLASTMODIFIED;
+            } else if (preq->unknown_n < NGX_DAV_PROPFIND_UNKNOWN_MAX) {
+                ngx_uint_t n;
+                ngx_flag_t dup = 0;
+
+                for (n = 0; n < preq->unknown_n; n++) {
+                    if (preq->unknown[n].len == lname_len) {
+                        size_t m;
+                        dup = 1;
+
+                        for (m = 0; m < lname_len; m++) {
+                            u_char a = preq->unknown[n].data[m];
+                            u_char b = data[lname_start + m];
+
+                            if (a >= 'A' && a <= 'Z') {
+                                a = (u_char) (a - 'A' + 'a');
+                            }
+                            if (b >= 'A' && b <= 'Z') {
+                                b = (u_char) (b - 'A' + 'a');
+                            }
+
+                            if (a != b) {
+                                dup = 0;
+                                break;
+                            }
+                        }
+
+                        if (dup) {
+                            break;
+                        }
+                    }
+                }
+
+                if (!dup) {
+                    preq->unknown[preq->unknown_n].data = (u_char *) (data + lname_start);
+                    preq->unknown[preq->unknown_n].len = lname_len;
+                    preq->unknown_n++;
+                }
+            }
+        }
+    }
+
+    if (!seen_propfind) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    if (seen_propname) {
+        preq->mode = NGX_DAV_PROPFIND_PROPNAME;
+        preq->props_mask = NGX_DAV_PROP_ALL_KNOWN;
+        return NGX_OK;
+    }
+
+    if (seen_prop) {
+        preq->mode = NGX_DAV_PROPFIND_PROP;
+        preq->props_mask = props_mask;
+        return (props_mask != 0 || preq->unknown_n != 0) ? NGX_OK : NGX_HTTP_BAD_REQUEST;
+    }
+
+    if (seen_allprop || seen_propfind) {
+        preq->mode = NGX_DAV_PROPFIND_ALLPROP;
+        preq->props_mask = NGX_DAV_PROP_ALL_KNOWN;
+        return NGX_OK;
+    }
+
+    return NGX_HTTP_BAD_REQUEST;
+}
+
+static ngx_int_t
+ngx_http_dav_propfind_append_unknown_propstat(ngx_http_request_t *r,
+    ngx_chain_t ***ll, off_t *total, ngx_http_dav_propfind_req_t *preq)
+{
+    if (preq->mode != NGX_DAV_PROPFIND_PROP || preq->unknown_n == 0) {
+        return NGX_OK;
+    }
+
+    if (ngx_http_dav_chain_append(r, ll, total,
+            (const u_char *) "<D:propstat>\n<D:prop>\n",
+            sizeof("<D:propstat>\n<D:prop>\n") - 1) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_uint_t i;
+    for (i = 0; i < preq->unknown_n; i++) {
+        if (ngx_http_dav_chain_append(r, ll, total,
+                (const u_char *) "<D:", sizeof("<D:") - 1) != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        if (ngx_http_dav_chain_append(r, ll, total,
+                preq->unknown[i].data, preq->unknown[i].len) != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        if (ngx_http_dav_chain_append(r, ll, total,
+                (const u_char *) "/>\n", sizeof("/>\n") - 1) != NGX_OK)
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    if (ngx_http_dav_chain_append(r, ll, total,
+            (const u_char *) "</D:prop>\n<D:status>HTTP/1.1 404 Not Found</D:status>\n</D:propstat>\n",
+            sizeof("</D:prop>\n<D:status>HTTP/1.1 404 Not Found</D:status>\n</D:propstat>\n") - 1) != NGX_OK)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_propfind_collect_body(ngx_http_request_t *r, ngx_str_t *body)
+{
+    body->data = NULL;
+    body->len = 0;
+
+    if (r->request_body == NULL || r->request_body->bufs == NULL) {
+        if (r->request_body == NULL || r->request_body->temp_file == NULL) {
+            return NGX_OK;
+        }
+    }
+
+    if (r->request_body->temp_file) {
+        ngx_str_t *fname = &r->request_body->temp_file->file.name;
+        if (fname->len == 0 || fname->data == NULL) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        int fd = open((char *) fname->data, O_RDONLY);
+        if (fd == -1) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        struct stat st;
+        if (fstat(fd, &st) == -1) {
+            close(fd);
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        if (st.st_size <= 0) {
+            close(fd);
+            return NGX_OK;
+        }
+
+        if (st.st_size > 128 * 1024) {
+            close(fd);
+            return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+        }
+
+        size_t n = (size_t) st.st_size;
+        u_char *p = ngx_pnalloc(r->pool, n + 1);
+        if (p == NULL) {
+            close(fd);
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        size_t got = 0;
+        while (got < n) {
+            ssize_t rd = read(fd, p + got, n - got);
+            if (rd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(fd);
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            if (rd == 0) {
+                break;
+            }
+            got += (size_t) rd;
+        }
+
+        close(fd);
+
+        p[got] = '\0';
+        body->data = p;
+        body->len = got;
+        return NGX_OK;
+    }
+
+    size_t total = 0;
+    ngx_chain_t *cl;
+    for (cl = r->request_body->bufs; cl; cl = cl->next) {
+        if (cl->buf == NULL) {
+            continue;
+        }
+
+        if (cl->buf->in_file && cl->buf->file && cl->buf->file_last > cl->buf->file_pos) {
+            total += (size_t) (cl->buf->file_last - cl->buf->file_pos);
+            if (total > 128 * 1024) {
+                return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+            }
+            continue;
+        }
+
+        if (cl->buf->last == NULL) {
+            continue;
+        }
+
+        u_char *s = cl->buf->pos;
+        u_char *e = cl->buf->last;
+
+        if ((s == NULL || s == e) && cl->buf->start && e > cl->buf->start) {
+            s = cl->buf->start;
+        }
+
+        if (s && e >= s) {
+            total += (size_t) (e - s);
+            if (total > 128 * 1024) {
+                return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+            }
+        }
+    }
+
+    if (total == 0) {
+        return NGX_OK;
+    }
+
+    u_char *p = ngx_pnalloc(r->pool, total + 1);
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    u_char *d = p;
+    for (cl = r->request_body->bufs; cl; cl = cl->next) {
+        if (cl->buf == NULL) {
+            continue;
+        }
+
+        if (cl->buf->in_file && cl->buf->file && cl->buf->file_last > cl->buf->file_pos) {
+            off_t pos = cl->buf->file_pos;
+            off_t end = cl->buf->file_last;
+            int fd = cl->buf->file->fd;
+            ngx_flag_t close_fd = 0;
+
+            if (fd == NGX_INVALID_FILE) {
+                fd = open((char *) cl->buf->file->name.data, O_RDONLY);
+                if (fd == -1) {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                close_fd = 1;
+            }
+
+            while (pos < end) {
+                size_t want = (size_t) (end - pos);
+                ssize_t rd = pread(fd, d, want, pos);
+                if (rd < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (close_fd) {
+                        close(fd);
+                    }
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                if (rd == 0) {
+                    break;
+                }
+                d += rd;
+                pos += rd;
+            }
+
+            if (close_fd) {
+                close(fd);
+            }
+            continue;
+        }
+
+        if (cl->buf->last == NULL) {
+            continue;
+        }
+
+        u_char *s = cl->buf->pos;
+        u_char *e = cl->buf->last;
+
+        if ((s == NULL || s == e) && cl->buf->start && e > cl->buf->start) {
+            s = cl->buf->start;
+        }
+
+        if (s && e > s) {
+            size_t n = (size_t) (e - s);
+            d = ngx_cpymem(d, s, n);
+        }
+    }
+
+    *d = '\0';
+    body->data = p;
+    body->len = total;
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_dav_handler(ngx_http_request_t *r)
 {
@@ -272,6 +894,8 @@ ngx_http_dav_handler(ngx_http_request_t *r)
         bit = 0x02;
     } else if (r->method_name.len == 5 && ngx_strncasecmp(r->method_name.data, (u_char *)"MKCOL", 5) == 0) {
         bit = 0x04;
+    } else if (r->method_name.len == 8 && ngx_strncasecmp(r->method_name.data, (u_char *)"PROPFIND", 8) == 0) {
+        bit = 0x20;
     } else if (r->method_name.len == 4 && ngx_strncasecmp(r->method_name.data, (u_char *)"COPY", 4) == 0) {
         bit = 0x08;
     } else if (r->method_name.len == 4 && ngx_strncasecmp(r->method_name.data, (u_char *)"MOVE", 4) == 0) {
@@ -315,6 +939,9 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 
     if (r->method_name.len == 5 && ngx_strncasecmp(r->method_name.data, (u_char *)"MKCOL", 5) == 0) {
         return ngx_http_dav_mkcol_handler(r);
+    }
+    if (r->method_name.len == 8 && ngx_strncasecmp(r->method_name.data, (u_char *)"PROPFIND", 8) == 0) {
+        return ngx_http_dav_propfind_handler(r);
     }
     if (r->method_name.len == 4 && ngx_strncasecmp(r->method_name.data, (u_char *)"COPY", 4) == 0) {
         return ngx_http_dav_copy_handler(r);
@@ -412,6 +1039,13 @@ ngx_http_dav_put_body_handler(ngx_http_request_t *r)
     ctx->done = 1;
     ngx_http_finalize_request(r, ctx->status);
     return;
+}
+
+static void
+ngx_http_dav_propfind_body_handler(ngx_http_request_t *r)
+{
+    ngx_int_t rc = ngx_http_dav_propfind_handler(r);
+    ngx_http_finalize_request(r, rc);
 }
 
 static ngx_int_t
@@ -615,6 +1249,416 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
     }
 
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
+}
+
+static ngx_int_t
+ngx_http_dav_propfind_handler(ngx_http_request_t *r)
+{
+    ngx_str_t                 path;
+    u_char                   *last;
+    ngx_chain_t              *out = NULL;
+    ngx_chain_t             **ll = &out;
+    ngx_chain_t              *cl;
+    ngx_file_info_t           sb;
+    ngx_uint_t                depth = 0;
+    char                      timebuf[64];
+    size_t                    time_len = 0;
+    u_char                   *clen = (u_char *) "0";
+    size_t                    clen_len = 1;
+    u_char                   *rtype = (u_char *) "";
+    ngx_str_t                 href_esc;
+    ngx_str_t                 disp_esc;
+    off_t                     content_length = 0;
+    ngx_http_dav_propfind_req_t preq;
+    ngx_str_t                 req_body;
+    ngx_http_dav_ctx_t       *ctx;
+
+#define NGX_DAV_XML_APPEND_LIT(_s)                                                \
+    if (ngx_http_dav_chain_append(r, &ll, &content_length,                        \
+            (const u_char *) (_s), sizeof(_s) - 1) != NGX_OK)                     \
+    {                                                                              \
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;                                     \
+    }
+
+#define NGX_DAV_XML_APPEND_BUF(_p, _n)                                            \
+    if (ngx_http_dav_chain_append(r, &ll, &content_length,                        \
+            (const u_char *) (_p), (_n)) != NGX_OK)                               \
+    {                                                                              \
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;                                     \
+    }
+
+    if (!(r->method_name.len == 8
+          && ngx_strncasecmp(r->method_name.data, (u_char *)"PROPFIND", 8) == 0))
+    {
+        return NGX_DECLINED;
+    }
+
+    preq.mode = NGX_DAV_PROPFIND_ALLPROP;
+    preq.props_mask = NGX_DAV_PROP_ALL_KNOWN;
+    preq.unknown_n = 0;
+    req_body.data = NULL;
+    req_body.len = 0;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_dav_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dav_ctx_t));
+        if (ctx == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_dav_module);
+    }
+
+    if ((r->request_body == NULL
+         || (r->request_body->bufs == NULL && r->request_body->temp_file == NULL))
+        && !ctx->propfind_body_attempted)
+    {
+        ctx->propfind_body_attempted = 1;
+
+        r->request_body_in_file_only = 1;
+        r->request_body_in_persistent_file = 1;
+        r->request_body_in_clean_file = 1;
+        r->request_body_file_group_access = 1;
+        r->request_body_file_log_level = 0;
+
+        ngx_int_t rb = ngx_http_read_client_request_body(r,
+                                                         ngx_http_dav_propfind_body_handler);
+        if (rb >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rb;
+        }
+        return NGX_DONE;
+    }
+
+    {
+        ngx_int_t body_rc = ngx_http_dav_propfind_collect_body(r, &req_body);
+        if (body_rc != NGX_OK) {
+            return body_rc;
+        }
+    }
+
+    if (req_body.len != 0) {
+        ngx_int_t prc = ngx_http_dav_propfind_parse_body(req_body.data, req_body.len, &preq);
+        if (prc != NGX_OK) {
+            return prc;
+        }
+    }
+
+    {
+        ngx_str_t depth_value = ngx_null_string;
+        ngx_list_part_t *part = &r->headers_in.headers.part;
+        ngx_table_elt_t *h = part->elts;
+        ngx_uint_t i = 0;
+
+        for ( ;; ) {
+            if (i >= part->nelts) {
+                if (part->next == NULL) {
+                    break;
+                }
+                part = part->next;
+                h = part->elts;
+                i = 0;
+            }
+
+            if (h[i].key.len == 5
+                && ngx_strncasecmp(h[i].key.data, (u_char *) "Depth", 5) == 0)
+            {
+                depth_value = h[i].value;
+                break;
+            }
+
+            i++;
+        }
+
+        if (depth_value.len != 0) {
+            if (depth_value.len == 1 && depth_value.data[0] == '0') {
+                depth = 0;
+            } else if (depth_value.len == 1 && depth_value.data[0] == '1') {
+                depth = 1;
+            } else if (depth_value.len == 8
+                       && ngx_strncasecmp(depth_value.data,
+                                          (u_char *) "infinity", 8) == 0)
+            {
+                return NGX_HTTP_BAD_REQUEST;
+            } else {
+                return NGX_HTTP_BAD_REQUEST;
+            }
+        }
+    }
+
+    size_t root_len;
+    last = ngx_http_map_uri_to_path(r, &path, &root_len, 0);
+    if (last == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (ngx_file_info((char *) path.data, &sb) == NGX_FILE_ERROR) {
+        if (ngx_errno == ENOENT) {
+            return NGX_HTTP_NOT_FOUND;
+        }
+        if (ngx_errno == EACCES || ngx_errno == EPERM) {
+            return NGX_HTTP_FORBIDDEN;
+        }
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    {
+        u_char *tlast = ngx_http_time((u_char *) timebuf, sb.st_mtime);
+        time_len = (size_t) (tlast - (u_char *) timebuf);
+    }
+
+    if (S_ISDIR(sb.st_mode)) {
+        rtype = (u_char *) "<D:collection/>";
+    } else {
+        clen = ngx_pnalloc(r->pool, NGX_OFF_T_LEN + 1);
+        if (clen == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        u_char *clast = ngx_sprintf(clen, "%O", (off_t) sb.st_size);
+        clen_len = (size_t) (clast - clen);
+    }
+
+    href_esc = ngx_http_dav_xml_escape(r->pool, r->uri.data, r->uri.len);
+    if (href_esc.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    disp_esc = ngx_http_dav_xml_escape(r->pool, r->uri.data, r->uri.len);
+    if (disp_esc.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    NGX_DAV_XML_APPEND_LIT("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    NGX_DAV_XML_APPEND_LIT("<D:multistatus xmlns:D=\"DAV:\">\n");
+    NGX_DAV_XML_APPEND_LIT("<D:response>\n");
+    NGX_DAV_XML_APPEND_LIT("<D:href>");
+    NGX_DAV_XML_APPEND_BUF(href_esc.data, href_esc.len);
+    NGX_DAV_XML_APPEND_LIT("</D:href>\n");
+    if (preq.mode != NGX_DAV_PROPFIND_PROP || preq.props_mask != 0) {
+        NGX_DAV_XML_APPEND_LIT("<D:propstat>\n");
+        NGX_DAV_XML_APPEND_LIT("<D:prop>\n");
+        if (preq.props_mask & NGX_DAV_PROP_DISPLAYNAME) {
+            if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                NGX_DAV_XML_APPEND_LIT("<D:displayname/>\n");
+            } else {
+                NGX_DAV_XML_APPEND_LIT("<D:displayname>");
+                NGX_DAV_XML_APPEND_BUF(disp_esc.data, disp_esc.len);
+                NGX_DAV_XML_APPEND_LIT("</D:displayname>\n");
+            }
+        }
+
+        if (preq.props_mask & NGX_DAV_PROP_RESOURCETYPE) {
+            if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                NGX_DAV_XML_APPEND_LIT("<D:resourcetype/>\n");
+            } else {
+                NGX_DAV_XML_APPEND_LIT("<D:resourcetype>");
+                NGX_DAV_XML_APPEND_BUF(rtype, ngx_strlen(rtype));
+                NGX_DAV_XML_APPEND_LIT("</D:resourcetype>\n");
+            }
+        }
+
+        if (preq.props_mask & NGX_DAV_PROP_GETCONTENTLENGTH) {
+            if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                NGX_DAV_XML_APPEND_LIT("<D:getcontentlength/>\n");
+            } else {
+                NGX_DAV_XML_APPEND_LIT("<D:getcontentlength>");
+                NGX_DAV_XML_APPEND_BUF(clen, clen_len);
+                NGX_DAV_XML_APPEND_LIT("</D:getcontentlength>\n");
+            }
+        }
+
+        if (preq.props_mask & NGX_DAV_PROP_GETLASTMODIFIED) {
+            if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                NGX_DAV_XML_APPEND_LIT("<D:getlastmodified/>\n");
+            } else {
+                NGX_DAV_XML_APPEND_LIT("<D:getlastmodified>");
+                NGX_DAV_XML_APPEND_BUF((u_char *) timebuf, time_len);
+                NGX_DAV_XML_APPEND_LIT("</D:getlastmodified>\n");
+            }
+        }
+        NGX_DAV_XML_APPEND_LIT("</D:prop>\n");
+        NGX_DAV_XML_APPEND_LIT("<D:status>HTTP/1.1 200 OK</D:status>\n");
+        NGX_DAV_XML_APPEND_LIT("</D:propstat>\n");
+    }
+
+    {
+        ngx_int_t urc = ngx_http_dav_propfind_append_unknown_propstat(r, &ll,
+                                                                       &content_length,
+                                                                       &preq);
+        if (urc != NGX_OK) {
+            return urc;
+        }
+    }
+    NGX_DAV_XML_APPEND_LIT("</D:response>\n");
+
+    if (depth == 1 && S_ISDIR(sb.st_mode)) {
+        DIR *d = opendir((char *) path.data);
+        if (d == NULL) {
+            if (errno == EACCES || errno == EPERM) {
+                return NGX_HTTP_FORBIDDEN;
+            }
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ngx_strcmp(ent->d_name, ".") == 0 || ngx_strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+
+            char namebuf[NAME_MAX + 1];
+            size_t nlen = strnlen(ent->d_name, NAME_MAX + 1);
+            if (nlen == 0 || nlen > NAME_MAX) {
+                continue;
+            }
+            ngx_memcpy(namebuf, ent->d_name, nlen);
+            namebuf[nlen] = '\0';
+
+            ngx_file_info_t csb;
+            if (fstatat(dirfd(d), namebuf, &csb, AT_SYMLINK_NOFOLLOW) == -1) {
+                continue;
+            }
+
+            char ctimebuf[64];
+            size_t ctime_len = 0;
+            {
+                u_char *ctlast = ngx_http_time((u_char *) ctimebuf, csb.st_mtime);
+                ctime_len = (size_t) (ctlast - (u_char *) ctimebuf);
+            }
+
+            u_char *child_rtype = (u_char *) "";
+            u_char *child_clen = (u_char *) "0";
+            size_t child_clen_len = 1;
+            if (S_ISDIR(csb.st_mode)) {
+                child_rtype = (u_char *) "<D:collection/>";
+            } else {
+                child_clen = ngx_pnalloc(r->pool, NGX_OFF_T_LEN + 1);
+                if (child_clen == NULL) {
+                    closedir(d);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                u_char *cclast = ngx_sprintf(child_clen, "%O", (off_t) csb.st_size);
+                child_clen_len = (size_t) (cclast - child_clen);
+            }
+
+            size_t urilen = r->uri.len;
+            ngx_flag_t has_trailing = (urilen > 0 && r->uri.data[urilen - 1] == '/');
+
+            size_t href_len = urilen + (has_trailing ? 0 : 1) + nlen + (S_ISDIR(csb.st_mode) ? 1 : 0);
+            u_char *href_raw = ngx_pnalloc(r->pool, href_len + 1);
+            if (href_raw == NULL) {
+                closedir(d);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            if (has_trailing) {
+                (void) ngx_snprintf(href_raw, href_len + 1, "%V%s%s", &r->uri,
+                                    namebuf, S_ISDIR(csb.st_mode) ? "/" : "");
+            } else {
+                (void) ngx_snprintf(href_raw, href_len + 1, "%V/%s%s", &r->uri,
+                                    namebuf, S_ISDIR(csb.st_mode) ? "/" : "");
+            }
+
+            ngx_str_t child_href_esc = ngx_http_dav_xml_escape(r->pool, href_raw, href_len);
+            if (child_href_esc.data == NULL) {
+                closedir(d);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            ngx_str_t child_disp_esc = ngx_http_dav_xml_escape(r->pool,
+                (u_char *) namebuf, nlen);
+            if (child_disp_esc.data == NULL) {
+                closedir(d);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            NGX_DAV_XML_APPEND_LIT("<D:response>\n");
+            NGX_DAV_XML_APPEND_LIT("<D:href>");
+            NGX_DAV_XML_APPEND_BUF(child_href_esc.data, child_href_esc.len);
+            NGX_DAV_XML_APPEND_LIT("</D:href>\n");
+            if (preq.mode != NGX_DAV_PROPFIND_PROP || preq.props_mask != 0) {
+                NGX_DAV_XML_APPEND_LIT("<D:propstat>\n");
+                NGX_DAV_XML_APPEND_LIT("<D:prop>\n");
+                if (preq.props_mask & NGX_DAV_PROP_DISPLAYNAME) {
+                    if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                        NGX_DAV_XML_APPEND_LIT("<D:displayname/>\n");
+                    } else {
+                        NGX_DAV_XML_APPEND_LIT("<D:displayname>");
+                        NGX_DAV_XML_APPEND_BUF(child_disp_esc.data, child_disp_esc.len);
+                        NGX_DAV_XML_APPEND_LIT("</D:displayname>\n");
+                    }
+                }
+
+                if (preq.props_mask & NGX_DAV_PROP_RESOURCETYPE) {
+                    if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                        NGX_DAV_XML_APPEND_LIT("<D:resourcetype/>\n");
+                    } else {
+                        NGX_DAV_XML_APPEND_LIT("<D:resourcetype>");
+                        NGX_DAV_XML_APPEND_BUF(child_rtype, ngx_strlen(child_rtype));
+                        NGX_DAV_XML_APPEND_LIT("</D:resourcetype>\n");
+                    }
+                }
+
+                if (preq.props_mask & NGX_DAV_PROP_GETCONTENTLENGTH) {
+                    if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                        NGX_DAV_XML_APPEND_LIT("<D:getcontentlength/>\n");
+                    } else {
+                        NGX_DAV_XML_APPEND_LIT("<D:getcontentlength>");
+                        NGX_DAV_XML_APPEND_BUF(child_clen, child_clen_len);
+                        NGX_DAV_XML_APPEND_LIT("</D:getcontentlength>\n");
+                    }
+                }
+
+                if (preq.props_mask & NGX_DAV_PROP_GETLASTMODIFIED) {
+                    if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
+                        NGX_DAV_XML_APPEND_LIT("<D:getlastmodified/>\n");
+                    } else {
+                        NGX_DAV_XML_APPEND_LIT("<D:getlastmodified>");
+                        NGX_DAV_XML_APPEND_BUF((u_char *) ctimebuf, ctime_len);
+                        NGX_DAV_XML_APPEND_LIT("</D:getlastmodified>\n");
+                    }
+                }
+                NGX_DAV_XML_APPEND_LIT("</D:prop>\n");
+                NGX_DAV_XML_APPEND_LIT("<D:status>HTTP/1.1 200 OK</D:status>\n");
+                NGX_DAV_XML_APPEND_LIT("</D:propstat>\n");
+            }
+
+            {
+                ngx_int_t urc = ngx_http_dav_propfind_append_unknown_propstat(r, &ll,
+                                                                               &content_length,
+                                                                               &preq);
+                if (urc != NGX_OK) {
+                    closedir(d);
+                    return urc;
+                }
+            }
+            NGX_DAV_XML_APPEND_LIT("</D:response>\n");
+        }
+
+        closedir(d);
+    }
+
+    NGX_DAV_XML_APPEND_LIT("</D:multistatus>\n");
+
+#undef NGX_DAV_XML_APPEND_LIT
+#undef NGX_DAV_XML_APPEND_BUF
+
+    if (out == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    for (cl = out; cl->next; cl = cl->next) {
+        /* walk to last chain link */
+    }
+    cl->buf->last_buf = 1;
+
+    r->headers_out.status = 207;
+    r->headers_out.content_length_n = content_length;
+    ngx_str_set(&r->headers_out.content_type, "application/xml; charset=utf-8");
+
+    ngx_int_t rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, out);
 }
 
 static ngx_int_t
@@ -1778,6 +2822,8 @@ ngx_conf_set_dav_methods(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             dlcf->methods_mask |= 0x02;
         } else if (m->len == 5 && ngx_strncasecmp(m->data, (u_char *)"MKCOL", 5) == 0) {
             dlcf->methods_mask |= 0x04;
+        } else if (m->len == 8 && ngx_strncasecmp(m->data, (u_char *)"PROPFIND", 8) == 0) {
+            dlcf->methods_mask |= 0x20;
         } else if (m->len == 4 && ngx_strncasecmp(m->data, (u_char *)"COPY", 4) == 0) {
             dlcf->methods_mask |= 0x08;
         } else if (m->len == 4 && ngx_strncasecmp(m->data, (u_char *)"MOVE", 4) == 0) {
