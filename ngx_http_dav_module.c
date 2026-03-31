@@ -354,6 +354,8 @@ ngx_http_dav_map_destination_path(ngx_http_request_t *r, ngx_str_t *duri,
 {
     size_t root_len;
     u_char *last;
+    size_t dlen;
+    u_char *stable;
     ngx_str_t old_uri;
 
     old_uri = r->uri;
@@ -365,6 +367,19 @@ ngx_http_dav_map_destination_path(ngx_http_request_t *r, ngx_str_t *duri,
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    dlen = ngx_strlen(path->data);
+    while (dlen > 1 && path->data[dlen - 1] == '/') {
+        dlen--;
+    }
+    stable = ngx_pnalloc(r->pool, dlen + 1);
+    if (stable == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_memcpy(stable, path->data, dlen);
+    stable[dlen] = '\0';
+    path->data = stable;
+    path->len = dlen;
+
     return NGX_OK;
 }
 
@@ -372,13 +387,22 @@ static ngx_int_t
 ngx_http_dav_prepare_destination_parent(ngx_http_request_t *r, ngx_str_t *path,
     ngx_http_dav_loc_conf_t *dlcf)
 {
-    u_char *p;
+    u_char *p, *end;
 
     if (path->len == 0) {
         return NGX_HTTP_FORBIDDEN;
     }
 
-    p = path->data + path->len - 1;
+    end = path->data + path->len;
+    while (end > path->data + 1 && *(end - 1) == '/') {
+        end--;
+    }
+
+    if (end <= path->data) {
+        return NGX_HTTP_FORBIDDEN;
+    }
+
+    p = end - 1;
     while (p > path->data && *p != '/') {
         p--;
     }
@@ -1119,7 +1143,7 @@ ngx_http_dav_sync_dead_props_tree(ngx_http_request_t *r, const char *src,
             closedir(dir);
             return NGX_ERROR;
         }
-        ngx_snprintf((u_char *) src_entry, src_entry_len, "%s/%s", src, ent->d_name);
+        ngx_snprintf((u_char *) src_entry, src_entry_len, "%s/%s%Z", src, ent->d_name);
 
         dst_entry_len = dlen + 1 + nlen + 1;
         dst_entry = ngx_pnalloc(r->pool, dst_entry_len);
@@ -1127,7 +1151,7 @@ ngx_http_dav_sync_dead_props_tree(ngx_http_request_t *r, const char *src,
             closedir(dir);
             return NGX_ERROR;
         }
-        ngx_snprintf((u_char *) dst_entry, dst_entry_len, "%s/%s", dst, ent->d_name);
+        ngx_snprintf((u_char *) dst_entry, dst_entry_len, "%s/%s%Z", dst, ent->d_name);
 
         if (lstat(src_entry, &est) == -1) {
             closedir(dir);
@@ -1281,115 +1305,175 @@ static ngx_int_t
 ngx_http_dav_xml_rewrite_to_d_namespace(ngx_pool_t *pool, const ngx_str_t *src,
     ngx_str_t *dst)
 {
-    size_t i, j, k, lname_start;
-    ngx_flag_t closing, self_closing;
-    u_char *out, *p;
-
     if (src == NULL || src->data == NULL || src->len == 0) {
         dst->data = NULL;
         dst->len = 0;
         return NGX_OK;
     }
 
-    out = ngx_pnalloc(pool, src->len * 2 + 16);
-    if (out == NULL) {
+    dst->data = ngx_pnalloc(pool, src->len);
+    if (dst->data == NULL) {
         return NGX_ERROR;
     }
 
-    p = out;
+    ngx_memcpy(dst->data, src->data, src->len);
+    dst->len = src->len;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dav_xml_extract_expanded_name(ngx_pool_t *pool, const ngx_str_t *xml,
+    ngx_str_t *out)
+{
+    size_t i, name_start, name_end, lname_start;
+    size_t ns_attr_name_start, ns_attr_name_end, vstart, vend;
+    size_t qprefix_len = 0;
+    u_char quote;
+    ngx_str_t default_ns, pref_ns;
+
+    out->data = NULL;
+    out->len = 0;
+
+    if (xml == NULL || xml->data == NULL || xml->len < 3) {
+        return NGX_ERROR;
+    }
+
     i = 0;
-    while (i < src->len) {
-        if (src->data[i] != '<') {
-            *p++ = src->data[i++];
-            continue;
-        }
-
-        *p++ = '<';
+    while (i < xml->len && xml->data[i] != '<') {
         i++;
-        if (i >= src->len) {
-            return NGX_ERROR;
-        }
+    }
+    if (i >= xml->len) {
+        return NGX_ERROR;
+    }
+    i++;
+    if (i < xml->len && xml->data[i] == '/') {
+        i++;
+    }
 
-        if (src->data[i] == '!' || src->data[i] == '?') {
-            while (i < src->len) {
-                *p++ = src->data[i];
-                if (src->data[i] == '>') {
-                    i++;
-                    break;
-                }
-                i++;
-            }
-            continue;
-        }
+    while (i < xml->len && (xml->data[i] == ' ' || xml->data[i] == '\t'
+           || xml->data[i] == '\r' || xml->data[i] == '\n'))
+    {
+        i++;
+    }
 
-        closing = 0;
-        if (src->data[i] == '/') {
-            closing = 1;
-            *p++ = '/';
-            i++;
-        }
+    name_start = i;
+    while (i < xml->len && ngx_http_dav_tag_name_char(xml->data[i])) {
+        i++;
+    }
+    name_end = i;
+    if (name_end <= name_start) {
+        return NGX_ERROR;
+    }
 
-        while (i < src->len && (src->data[i] == ' ' || src->data[i] == '\t'
-               || src->data[i] == '\r' || src->data[i] == '\n'))
+    lname_start = name_start;
+    for (i = name_start; i < name_end; i++) {
+        if (xml->data[i] == ':') {
+            qprefix_len = i - name_start;
+            lname_start = i + 1;
+        }
+    }
+
+    default_ns.data = NULL;
+    default_ns.len = 0;
+    pref_ns.data = NULL;
+    pref_ns.len = 0;
+
+    i = name_end;
+    while (i < xml->len && xml->data[i] != '>') {
+        while (i < xml->len && (xml->data[i] == ' ' || xml->data[i] == '\t'
+               || xml->data[i] == '\r' || xml->data[i] == '\n'))
         {
             i++;
         }
 
-        j = i;
-        while (j < src->len && ngx_http_dav_tag_name_char(src->data[j])) {
-            j++;
+        ns_attr_name_start = i;
+        while (i < xml->len && ngx_http_dav_tag_name_char(xml->data[i])) {
+            i++;
         }
-        if (j == i) {
+        ns_attr_name_end = i;
+
+        while (i < xml->len && (xml->data[i] == ' ' || xml->data[i] == '\t'
+               || xml->data[i] == '\r' || xml->data[i] == '\n'))
+        {
+            i++;
+        }
+        if (i >= xml->len || xml->data[i] != '=') {
+            while (i < xml->len && xml->data[i] != '>' && xml->data[i] != ' ') {
+                i++;
+            }
+            continue;
+        }
+        i++;
+        while (i < xml->len && (xml->data[i] == ' ' || xml->data[i] == '\t'
+               || xml->data[i] == '\r' || xml->data[i] == '\n'))
+        {
+            i++;
+        }
+        if (i >= xml->len || (xml->data[i] != '"' && xml->data[i] != '\'')) {
+            continue;
+        }
+
+        quote = xml->data[i++];
+        vstart = i;
+        while (i < xml->len && xml->data[i] != quote) {
+            i++;
+        }
+        if (i > xml->len) {
+            return NGX_ERROR;
+        }
+        vend = i;
+        if (i < xml->len) {
+            i++;
+        }
+
+        if (ns_attr_name_end == ns_attr_name_start + (sizeof("xmlns") - 1)
+            && ngx_strncasecmp(xml->data + ns_attr_name_start,
+                               (u_char *) "xmlns", sizeof("xmlns") - 1) == 0)
+        {
+            default_ns.data = xml->data + vstart;
+            default_ns.len = vend - vstart;
+            continue;
+        }
+
+        if (qprefix_len > 0
+            && ns_attr_name_end == ns_attr_name_start
+                                   + (sizeof("xmlns:") - 1) + qprefix_len
+            && ngx_strncasecmp(xml->data + ns_attr_name_start,
+                               (u_char *) "xmlns:", sizeof("xmlns:") - 1) == 0
+            && ngx_strncasecmp(xml->data + ns_attr_name_start
+                               + (sizeof("xmlns:") - 1),
+                               xml->data + name_start, qprefix_len) == 0)
+        {
+            pref_ns.data = xml->data + vstart;
+            pref_ns.len = vend - vstart;
+        }
+    }
+
+    {
+        ngx_str_t ns;
+        size_t lname_len = name_end - lname_start;
+        u_char *p;
+
+        if (qprefix_len > 0) {
+            ns = pref_ns;
+        } else {
+            ns = default_ns;
+        }
+
+        out->len = 1 + ns.len + 1 + lname_len;
+        out->data = ngx_pnalloc(pool, out->len);
+        if (out->data == NULL) {
             return NGX_ERROR;
         }
 
-        lname_start = i;
-        for (k = i; k < j; k++) {
-            if (src->data[k] == ':') {
-                lname_start = k + 1;
-            }
-        }
-
-        *p++ = 'D';
-        *p++ = ':';
-        p = ngx_cpymem(p, src->data + lname_start, j - lname_start);
-
-        self_closing = 0;
-        i = j;
-        while (i < src->len && src->data[i] != '>') {
-            if (src->data[i] == '"' || src->data[i] == '\'') {
-                u_char q = src->data[i++];
-                while (i < src->len && src->data[i] != q) {
-                    i++;
-                }
-                if (i < src->len) {
-                    i++;
-                }
-                continue;
-            }
-            if (src->data[i] == '/' && i + 1 < src->len && src->data[i + 1] == '>') {
-                self_closing = 1;
-                i += 2;
-                break;
-            }
-            i++;
-        }
-
-        if (!self_closing) {
-            if (i >= src->len || src->data[i] != '>') {
-                return NGX_ERROR;
-            }
-            i++;
-        }
-
-        if (!closing && self_closing) {
-            *p++ = '/';
-        }
-        *p++ = '>';
+        p = out->data;
+        *p++ = '{';
+        p = ngx_cpymem(p, ns.data, ns.len);
+        *p++ = '}';
+        p = ngx_cpymem(p, xml->data + lname_start, lname_len);
     }
 
-    dst->data = out;
-    dst->len = (size_t) (p - out);
     return NGX_OK;
 }
 
@@ -1403,16 +1487,72 @@ ngx_http_dav_dead_props_add(ngx_http_request_t *r, ngx_http_dav_dead_props_t *de
     ngx_str_t normalized;
 
     idx = ngx_http_dav_dead_props_find(dead, name);
-    if (idx >= 0) {
-        if (xml != NULL && xml->len > 0) {
-            if (ngx_http_dav_xml_rewrite_to_d_namespace(r->pool, xml,
-                                                        &normalized)
+    if (idx >= 0 && xml != NULL && xml->len > 0) {
+        ngx_str_t new_xname, cur_xname;
+        ngx_int_t m;
+
+        if (ngx_http_dav_xml_rewrite_to_d_namespace(r->pool, xml,
+                                                    &normalized)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (ngx_http_dav_xml_extract_expanded_name(r->pool, &normalized,
+                                                   &new_xname)
+            != NGX_OK)
+        {
+            dead->xml[idx] = normalized;
+            return NGX_OK;
+        }
+
+        for (m = 0; m < (ngx_int_t) dead->n; m++) {
+            if (!ngx_http_dav_str_ieq(&dead->names[m], name)) {
+                continue;
+            }
+
+            if (ngx_http_dav_xml_extract_expanded_name(r->pool,
+                                                       &dead->xml[m],
+                                                       &cur_xname)
                 != NGX_OK)
             {
-                return NGX_ERROR;
+                continue;
             }
-            dead->xml[idx] = normalized;
+
+            if (cur_xname.len == new_xname.len
+                && ngx_strncmp(cur_xname.data, new_xname.data,
+                               new_xname.len) == 0)
+            {
+                dead->xml[m] = normalized;
+                return NGX_OK;
+            }
         }
+
+        if (dead->n >= NGX_DAV_PROPPATCH_PROPS_MAX) {
+            return NGX_ERROR;
+        }
+
+        p = ngx_pnalloc(r->pool, name->len);
+        if (p == NULL) {
+            return NGX_ERROR;
+        }
+        for (i = 0; i < name->len; i++) {
+            u_char c = name->data[i];
+            if (c >= 'A' && c <= 'Z') {
+                c = (u_char) (c - 'A' + 'a');
+            }
+            p[i] = c;
+        }
+
+        dead->names[dead->n].data = p;
+        dead->names[dead->n].len = name->len;
+        dead->xml[dead->n] = normalized;
+        dead->n++;
+
+        return NGX_OK;
+    }
+
+    if (idx >= 0) {
         return NGX_OK;
     }
 
@@ -1722,8 +1862,24 @@ ngx_http_dav_propfind_parse_body(const u_char *data, size_t len,
 
         ngx_flag_t self_closing = 0;
         size_t k = i;
+        ngx_flag_t in_quote = 0;
+        u_char quote = 0;
+
         while (k < len && data[k] != '>') {
-            if (data[k] == '/') {
+            if (!in_quote && (data[k] == '"' || data[k] == '\'')) {
+                in_quote = 1;
+                quote = data[k];
+                k++;
+                continue;
+            }
+
+            if (in_quote && data[k] == quote) {
+                in_quote = 0;
+                k++;
+                continue;
+            }
+
+            if (!in_quote && data[k] == '/') {
                 size_t t = k + 1;
                 while (t < len && (data[t] == ' ' || data[t] == '\t'
                        || data[t] == '\r' || data[t] == '\n'))
@@ -1734,6 +1890,42 @@ ngx_http_dav_propfind_parse_body(const u_char *data, size_t len,
                     self_closing = 1;
                 }
             }
+
+            if (!in_quote
+                && k + 7 < len
+                && data[k] == 'x' && data[k + 1] == 'm'
+                && data[k + 2] == 'l' && data[k + 3] == 'n'
+                && data[k + 4] == 's' && data[k + 5] == ':')
+            {
+                size_t p = k + 6;
+
+                while (p < len && ngx_http_dav_tag_name_char(data[p])) {
+                    p++;
+                }
+
+                while (p < len && (data[p] == ' ' || data[p] == '\t'
+                       || data[p] == '\r' || data[p] == '\n'))
+                {
+                    p++;
+                }
+
+                if (p < len && data[p] == '=') {
+                    p++;
+                    while (p < len && (data[p] == ' ' || data[p] == '\t'
+                           || data[p] == '\r' || data[p] == '\n'))
+                    {
+                        p++;
+                    }
+
+                    if (p + 1 < len
+                        && ((data[p] == '"' && data[p + 1] == '"')
+                            || (data[p] == '\'' && data[p + 1] == '\'')))
+                    {
+                        return NGX_HTTP_BAD_REQUEST;
+                    }
+                }
+            }
+
             k++;
         }
 
@@ -1919,25 +2111,29 @@ ngx_http_dav_propfind_append_unknown_propstat(ngx_http_request_t *r,
         }
 
         for (i = 0; i < preq->unknown_n; i++) {
+            ngx_uint_t j;
+
             if (dead == NULL || !ngx_http_dav_dead_props_contains(dead, &preq->unknown[i])) {
                 continue;
             }
 
-            idx = ngx_http_dav_dead_props_find(dead, &preq->unknown[i]);
-            if (idx < 0) {
-                continue;
-            }
+            for (j = 0; j < dead->n; j++) {
+                if (!ngx_http_dav_str_ieq(&dead->names[j], &preq->unknown[i])) {
+                    continue;
+                }
 
-            if (ngx_http_dav_chain_append(r, ll, total,
-                    dead->xml[idx].data, dead->xml[idx].len) != NGX_OK)
-            {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
+                idx = (ngx_int_t) j;
+                if (ngx_http_dav_chain_append(r, ll, total,
+                        dead->xml[idx].data, dead->xml[idx].len) != NGX_OK)
+                {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
 
-            if (ngx_http_dav_chain_append(r, ll, total,
-                    (const u_char *) "\n", sizeof("\n") - 1) != NGX_OK)
-            {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                if (ngx_http_dav_chain_append(r, ll, total,
+                        (const u_char *) "\n", sizeof("\n") - 1) != NGX_OK)
+                {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
             }
         }
 
@@ -2920,7 +3116,13 @@ ngx_http_dav_put_body_handler(ngx_http_request_t *r)
 
     if (ngx_ext_rename_file(&r->request_body->temp_file->file.name, &path, &ext) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: rename failed for '%V'", &path);
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        if (ngx_errno == ENOENT || ngx_errno == NGX_ENOPATH) {
+            ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
+        } else if (ngx_errno == EACCES || ngx_errno == EPERM) {
+            ngx_http_finalize_request(r, NGX_HTTP_FORBIDDEN);
+        } else {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
         return;
     }
 
@@ -3419,21 +3621,20 @@ static ngx_int_t
 
         /* file or directory removal */
         if (S_ISDIR(sb.st_mode)) {
-            if (rmdir((char *) path.data) == 0) {
+            if (ngx_http_dav_remove_tree(r, (char *) path.data) == NGX_OK) {
                 ngx_http_dav_delete_dead_props_for_path(r, &path);
                 return NGX_HTTP_NO_CONTENT;
             }
+
             if (ngx_errno == ENOENT) {
                 return NGX_HTTP_NOT_FOUND;
             }
-            if (ngx_errno == EEXIST || ngx_errno == ENOTEMPTY) {
-                return NGX_HTTP_CONFLICT;
-            }
-            if (ngx_errno == EACCES) {
+            if (ngx_errno == EACCES || ngx_errno == EPERM) {
                 return NGX_HTTP_FORBIDDEN;
             }
+
             ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                          "dav: rmdir('%V') failed", &path);
+                          "dav: remove_tree('%V') failed", &path);
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
@@ -3465,6 +3666,9 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
     ngx_http_dav_loc_conf_t  *dlcf;
     ngx_str_t                 path;
     u_char                   *last;
+    u_char                   *end;
+    u_char                   *p;
+    u_char                    saved_end;
 
 
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
@@ -3478,17 +3682,51 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+        return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
+    }
+
+    {
+        ngx_table_elt_t *h;
+
+        h = ngx_http_dav_find_header(r, "Content-Length", sizeof("Content-Length") - 1);
+        if (h && h->value.len > 0) {
+            if (!(h->value.len == 1 && h->value.data[0] == '0')) {
+                return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
+            }
+        }
+
+        h = ngx_http_dav_find_header(r, "Transfer-Encoding", sizeof("Transfer-Encoding") - 1);
+        if (h && h->value.len > 0) {
+            return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
+        }
+    }
+
+    end = last;
+    while (end > path.data + 1 && *(end - 1) == '/') {
+        end--;
+    }
+
+    if (end <= path.data) {
+        return NGX_HTTP_FORBIDDEN;
+    }
+
+    saved_end = *end;
+    *end = '\0';
+
     /* if target exists, MKCOL must fail */
     ngx_file_info_t sb;
     if (ngx_file_info((char *) path.data, &sb) != NGX_FILE_ERROR) {
+        *end = saved_end;
         return NGX_HTTP_NOT_ALLOWED;
     }
 
     /* ensure parent exists (or create it when requested) */
     {
-        u_char *p = path.data + path.len - 1;
+        p = end - 1;
         while (p > path.data && *p != '/') p--;
         if (p <= path.data) {
+            *end = saved_end;
             return NGX_HTTP_FORBIDDEN;
         }
 
@@ -3498,6 +3736,7 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
             *p = '\0';
             if (ngx_create_full_path(path.data, dlcf->access_dir_mode) == NGX_FILE_ERROR) {
                 *p = saved;
+                *end = saved_end;
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
             *p = saved;
@@ -3510,8 +3749,10 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
 
             if (ngx_file_info(parent, &sb) == NGX_FILE_ERROR) {
                 if (ngx_errno == ENOENT) {
+                    *end = saved_end;
                     return NGX_HTTP_CONFLICT; /* parent doesn't exist */
                 }
+                *end = saved_end;
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         }
@@ -3519,8 +3760,11 @@ ngx_http_dav_mkcol_handler(ngx_http_request_t *r)
 
     /* create directory (final component) */
     if (mkdir((char *) path.data, dlcf->access_dir_mode) == 0) {
+        *end = saved_end;
         return NGX_HTTP_CREATED;
     }
+
+    *end = saved_end;
 
     if (ngx_errno == EEXIST) {
         return NGX_HTTP_NOT_ALLOWED;
@@ -3922,6 +4166,7 @@ ngx_http_dav_copy_handler(ngx_http_request_t *r)
     ngx_http_dav_loc_conf_t  *dlcf;
     ngx_str_t src, dst, dest_uri;
     ngx_uint_t overwrite = 1;
+    ngx_int_t  depth = NGX_HTTP_DAV_INFINITY_DEPTH;
 
     if (!(r->method_name.len == 4
           && ngx_strncasecmp(r->method_name.data, (u_char *)"COPY", 4) == 0))
@@ -3939,7 +4184,7 @@ ngx_http_dav_copy_handler(ngx_http_request_t *r)
     }
 
     {
-        ngx_int_t depth = ngx_http_dav_depth(r, NGX_HTTP_DAV_INFINITY_DEPTH);
+        depth = ngx_http_dav_depth(r, NGX_HTTP_DAV_INFINITY_DEPTH);
         if (depth != NGX_HTTP_DAV_INFINITY_DEPTH && depth != NGX_HTTP_DAV_ZERO_DEPTH) {
             return NGX_HTTP_BAD_REQUEST;
         }
@@ -4007,14 +4252,35 @@ ngx_http_dav_copy_handler(ngx_http_request_t *r)
     }
 
     if (S_ISDIR(sst_src.st_mode)) {
-        if (ngx_http_dav_copy_dir(r, (char *) src.data, (char *) dst.data) != NGX_OK) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
+        if (depth == NGX_HTTP_DAV_ZERO_DEPTH) {
+            if (ngx_create_dir((char *) dst.data, dlcf->access_dir_mode)
+                == NGX_FILE_ERROR)
+            {
+                if (ngx_errno == EEXIST) {
+                    return NGX_HTTP_PRECONDITION_FAILED;
+                }
+                if (ngx_errno == EACCES || ngx_errno == EPERM) {
+                    return NGX_HTTP_FORBIDDEN;
+                }
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
 
-        if (ngx_http_dav_sync_dead_props_tree(r, (char *) src.data,
-                                              (char *) dst.data, 0) != NGX_OK)
-        {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 0)
+                != NGX_OK)
+            {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+        } else {
+            if (ngx_http_dav_copy_dir(r, (char *) src.data, (char *) dst.data) != NGX_OK) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            if (ngx_http_dav_sync_dead_props_tree(r, (char *) src.data,
+                                                  (char *) dst.data, 0) != NGX_OK)
+            {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
         }
 
     } else if (S_ISREG(sst_src.st_mode)) {
@@ -4096,6 +4362,16 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
     ngx_file_info_t fi;
     ngx_flag_t dest_exists = (ngx_file_info((char *) dst.data, &fi) == 0);
     if (dest_exists && !overwrite) return NGX_HTTP_PRECONDITION_FAILED;
+
+    if (dest_exists && overwrite && S_ISDIR(fi.st_mode) && !S_ISDIR(src_st.st_mode)) {
+        if (ngx_http_dav_remove_tree(r, (char *) dst.data) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dav: remove dst tree failed '%V'", &dst);
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        dest_exists = 0;
+    }
+
     ngx_ext_rename_file_t ext;
     ext.access = 0;
     ext.path_access = dlcf->access_dir_mode;
@@ -4104,19 +4380,26 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
     ext.delete_file = 0; /* do not delete source on failure */
     ext.log = r->connection->log;
 
-    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                  "dav: MOVE attempt src='%V' dst='%V' overwrite=%d",
-                  &src, &dst, (int) overwrite);
-
     /* Pre-emptive handling for directory overwrite: remove existing dst and rename. */
     if (dest_exists && overwrite && S_ISDIR(src_st.st_mode)) {
-            if (ngx_http_dav_remove_tree(r, (char *) dst.data) != NGX_OK) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove dst tree failed '%V'", &dst);
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            if (S_ISDIR(fi.st_mode)) {
+                if (ngx_http_dav_remove_tree(r, (char *) dst.data) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "dav: remove dst tree failed '%V'", &dst);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+            } else {
+                if (ngx_delete_file((char *) dst.data) != 0) {
+                    if (ngx_errno == EACCES || ngx_errno == EPERM) {
+                        return NGX_HTTP_FORBIDDEN;
+                    }
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "dav: remove dst file failed '%V'", &dst);
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
             }
 
             if (ngx_ext_rename_file(&src, &dst, &ext) == NGX_OK) {
-                ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "dav: MOVE success src='%V' dst='%V'", &src, &dst);
                 if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 1) != NGX_OK) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
@@ -4127,11 +4410,15 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
                 if (ngx_http_dav_copy_dir(r, (char *) src.data, (char *) dst.data) != NGX_OK) {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
+
+                if (ngx_http_dav_sync_dead_props_tree(r, (char *) src.data,
+                                                      (char *) dst.data, 1) != NGX_OK)
+                {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 1) != NGX_OK) {
+
+                if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 return NGX_HTTP_NO_CONTENT;
@@ -4145,10 +4432,6 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
     if (ngx_ext_rename_file(&src, &dst, &ext) != NGX_OK) {
         /* cross-device link? try copy+unlink fallback */
         if (ngx_errno == EXDEV) {
-            ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                          "dav: rename EXDEV, attempting copy fallback src='%V' dst='%V'",
-                          &src, &dst);
-
             /* open source without following symlinks to mitigate TOCTOU */
             int infd = open((char *) src.data, O_RDONLY | O_NOFOLLOW);
             if (infd == -1) {
@@ -4170,11 +4453,15 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 close(infd);
-                if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
+
+                if (ngx_http_dav_sync_dead_props_tree(r, (char *) src.data,
+                                                      (char *) dst.data, 1) != NGX_OK)
+                {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 1) != NGX_OK) {
+
+                if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
                 return dest_exists ? NGX_HTTP_NO_CONTENT : NGX_HTTP_CREATED;
@@ -4267,16 +4554,30 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
         }
 
         /* if destination exists and overwrite requested, try remove dst then retry */
-        if ((ngx_errno == EEXIST || ngx_errno == ENOTEMPTY) && dest_exists && overwrite) {
+        if ((ngx_errno == EEXIST || ngx_errno == ENOTEMPTY || ngx_errno == EISDIR)
+            && dest_exists && overwrite)
+        {
             /* perform atomic replace: handle directories specially, files via temp-file replace */
 
             /* check if source is a directory (handle directory overwrite by removing dst then rename/copy) */
             {
                 if (S_ISDIR(src_st.st_mode)) {
-                    /* remove existing destination tree to allow rename into place */
-                    if (ngx_http_dav_remove_tree(r, (char *) dst.data) != NGX_OK) {
-                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove dst tree failed '%V'", &dst);
-                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    /* remove existing destination to allow rename into place */
+                    if (S_ISDIR(fi.st_mode)) {
+                        if (ngx_http_dav_remove_tree(r, (char *) dst.data) != NGX_OK) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                          "dav: remove dst tree failed '%V'", &dst);
+                            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                    } else {
+                        if (ngx_delete_file((char *) dst.data) != 0) {
+                            if (ngx_errno == EACCES || ngx_errno == EPERM) {
+                                return NGX_HTTP_FORBIDDEN;
+                            }
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                          "dav: remove dst file failed '%V'", &dst);
+                            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                        }
                     }
 
                     /* try rename now that dst removed */
@@ -4292,11 +4593,15 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
                         if (ngx_http_dav_copy_dir(r, (char *) src.data, (char *) dst.data) != NGX_OK) {
                             return NGX_HTTP_INTERNAL_SERVER_ERROR;
                         }
-                        if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
-                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
+
+                        if (ngx_http_dav_sync_dead_props_tree(r, (char *) src.data,
+                                                              (char *) dst.data, 1) != NGX_OK)
+                        {
                             return NGX_HTTP_INTERNAL_SERVER_ERROR;
                         }
-                        if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 1) != NGX_OK) {
+
+                        if (ngx_http_dav_remove_tree(r, (char *) src.data) != NGX_OK) {
+                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "dav: remove src tree failed '%V'", &src);
                             return NGX_HTTP_INTERNAL_SERVER_ERROR;
                         }
                         return NGX_HTTP_NO_CONTENT;
@@ -4310,9 +4615,6 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
             }
 
             /* perform atomic replace for regular files: copy src -> temp in dst dir, rename temp->dst */
-            ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                          "dav: atomic replace dst '%V' to honor Overwrite=T", &dst);
-
             int infd = open((char *) src.data, O_RDONLY | O_NOFOLLOW);
             if (infd == -1) {
                 if (ngx_errno == ENOENT) return NGX_HTTP_NOT_FOUND;
@@ -4388,7 +4690,6 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "dav: MOVE success src='%V' dst='%V'", &src, &dst);
     if (ngx_http_dav_sync_dead_props_between_paths(r, &src, &dst, 1) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -4408,12 +4709,24 @@ ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char
 
     int infd = open(src, O_RDONLY | O_NOFOLLOW);
     if (infd == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file open(src) failed '%s'", src);
         return NGX_ERROR;
     }
 
     struct stat st;
-    if (fstat(infd, &st) == -1) { close(infd); return NGX_ERROR; }
-    if (S_ISLNK(st.st_mode)) { close(infd); return NGX_ERROR; }
+    if (fstat(infd, &st) == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file fstat failed '%s'", src);
+        close(infd);
+        return NGX_ERROR;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dav: copy_file refusing symlink '%s'", src);
+        close(infd);
+        return NGX_ERROR;
+    }
 
     size_t dstlen = ngx_strlen(dst);
     size_t tpl_len = dstlen + sizeof(".davXXXXXX") + 1;
@@ -4424,8 +4737,17 @@ ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char
     tmp_path[dstlen + sizeof(".davXXXXXX") - 1] = '\0';
 
     int outfd = mkstemp(tmp_path);
-    if (outfd == -1) { close(infd); return NGX_ERROR; }
-    if (fchmod(outfd, dlcf->access_file_mode) == -1) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+    if (outfd == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file mkstemp failed '%s'", tmp_path);
+        close(infd);
+        return NGX_ERROR;
+    }
+    if (fchmod(outfd, dlcf->access_file_mode) == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file fchmod failed '%s'", tmp_path);
+        close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR;
+    }
 
     ssize_t nread;
     char buf[8192];
@@ -4434,18 +4756,30 @@ ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char
         char *p = buf;
         while (towrite > 0) {
             ssize_t nw = write(outfd, p, towrite);
-            if (nw <= 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+            if (nw <= 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                              "dav: copy_file write failed '%s'", tmp_path);
+                close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR;
+            }
             towrite -= nw; p += nw;
         }
     }
 
-    if (nread < 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR; }
+    if (nread < 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file read failed '%s'", src);
+        close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_ERROR;
+    }
 
     fsync(outfd);
     close(outfd);
     close(infd);
 
-    if (rename(tmp_path, dst) != 0) { ngx_delete_file(tmp_path); return NGX_ERROR; }
+    if (rename(tmp_path, dst) != 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_file rename failed '%s' -> '%s'", tmp_path, dst);
+        ngx_delete_file(tmp_path); return NGX_ERROR;
+    }
 
     /* preserve timestamps */
     struct utimbuf times;
@@ -4467,12 +4801,26 @@ ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst)
     }
 
     DIR *d = opendir(src);
-    if (d == NULL) return NGX_ERROR;
+    if (d == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_dir opendir failed '%s'", src);
+        return NGX_ERROR;
+    }
 
     struct stat st;
-    if (stat(src, &st) == -1) { closedir(d); return NGX_ERROR; }
+    if (stat(src, &st) == -1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "dav: copy_dir stat failed '%s'", src);
+        closedir(d);
+        return NGX_ERROR;
+    }
     if (mkdir(dst, dlcf->access_dir_mode) == -1) {
-        if (errno != EEXIST) { closedir(d); return NGX_ERROR; }
+        if (errno != EEXIST) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                          "dav: copy_dir mkdir failed '%s'", dst);
+            closedir(d);
+            return NGX_ERROR;
+        }
     }
 
     struct dirent *ent;
@@ -4483,20 +4831,42 @@ ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst)
         size_t entry_len = slen + 1 + strlen(ent->d_name) + 1;
         char *src_entry = ngx_pnalloc(r->pool, entry_len);
         if (src_entry == NULL) { closedir(d); return NGX_ERROR; }
-        ngx_snprintf((u_char *) src_entry, entry_len, "%s/%s", src, ent->d_name);
+        ngx_snprintf((u_char *) src_entry, entry_len, "%s/%s%Z", src, ent->d_name);
 
         size_t dst_entry_len = dlen + 1 + strlen(ent->d_name) + 1;
         char *dst_entry = ngx_pnalloc(r->pool, dst_entry_len);
         if (dst_entry == NULL) { closedir(d); return NGX_ERROR; }
-        ngx_snprintf((u_char *) dst_entry, dst_entry_len, "%s/%s", dst, ent->d_name);
+        ngx_snprintf((u_char *) dst_entry, dst_entry_len, "%s/%s%Z", dst, ent->d_name);
 
         struct stat est;
-        if (lstat(src_entry, &est) == -1) { closedir(d); return NGX_ERROR; }
-        if (S_ISLNK(est.st_mode)) { closedir(d); return NGX_ERROR; }
+        if (lstat(src_entry, &est) == -1) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                          "dav: copy_dir lstat failed '%s'", src_entry);
+            closedir(d);
+            return NGX_ERROR;
+        }
+        if (S_ISLNK(est.st_mode)) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dav: copy_dir refusing symlink '%s'", src_entry);
+            closedir(d);
+            return NGX_ERROR;
+        }
         if (S_ISDIR(est.st_mode)) {
-            if (ngx_http_dav_copy_dir(r, src_entry, dst_entry) != NGX_OK) { closedir(d); return NGX_ERROR; }
+            if (ngx_http_dav_copy_dir(r, src_entry, dst_entry) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "dav: copy_dir recursive copy failed '%s' -> '%s'",
+                              src_entry, dst_entry);
+                closedir(d);
+                return NGX_ERROR;
+            }
         } else if (S_ISREG(est.st_mode)) {
-            if (ngx_http_dav_copy_file_atomic(r, src_entry, dst_entry) != NGX_OK) { closedir(d); return NGX_ERROR; }
+            if (ngx_http_dav_copy_file_atomic(r, src_entry, dst_entry) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "dav: copy_dir file copy failed '%s' -> '%s'",
+                              src_entry, dst_entry);
+                closedir(d);
+                return NGX_ERROR;
+            }
         } else {
             /* skip special files */
         }
