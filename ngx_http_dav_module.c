@@ -10,9 +10,7 @@
 #include <dirent.h>
 #include <utime.h>
 #include <stdio.h>
-#include <ctype.h>
 #include <time.h>
-#include <sys/file.h>
 
 extern ngx_module_t ngx_http_dav_module;
 
@@ -39,10 +37,13 @@ static ngx_int_t ngx_http_dav_move_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_lock_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_unlock_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_dav_init(ngx_conf_t *cf);
-static ngx_int_t ngx_http_dav_copy_file_atomic(ngx_http_request_t *r, const char *src, const char *dst);
-static ngx_int_t ngx_http_dav_copy_dir(ngx_http_request_t *r, const char *src, const char *dst);
+static ngx_int_t ngx_http_dav_copy_file_atomic(ngx_http_request_t *r,
+    const char *src, const char *dst);
+static ngx_int_t ngx_http_dav_copy_dir(ngx_http_request_t *r,
+    const char *src, const char *dst);
 static ngx_int_t ngx_http_dav_remove_tree(ngx_http_request_t *r, const char *path);
-static ngx_int_t ngx_http_dav_unlink_if_unchanged(ngx_http_request_t *r, const char *path, const ngx_file_info_t *orig_st);
+static ngx_int_t ngx_http_dav_unlink_if_unchanged(ngx_http_request_t *r,
+    const char *path, const ngx_file_info_t *orig_st);
 static ngx_str_t ngx_http_dav_xml_escape(ngx_pool_t *pool, const u_char *src, size_t len);
 static ngx_table_elt_t *ngx_http_dav_find_header(ngx_http_request_t *r,
     const char *name, size_t len);
@@ -221,8 +222,6 @@ struct ngx_http_dav_dead_props_s {
 
 struct ngx_http_dav_loc_conf_s {
         ngx_flag_t    create_full_path;
-        ngx_array_t  *dav_methods;
-        ngx_array_t  *dav_access;
         ngx_uint_t    min_delete_depth;
     ngx_uint_t    methods_mask;
     ngx_uint_t    access_file_mode;
@@ -231,7 +230,6 @@ struct ngx_http_dav_loc_conf_s {
     ngx_uint_t    lock_timeout_min;
     ngx_uint_t    lock_timeout_max;
     ngx_uint_t    lock_zone_timeout;
-    ngx_str_t     lock_store_path;
     ngx_shm_zone_t *lock_zone;
 };
 
@@ -245,8 +243,40 @@ typedef struct {
 
 static void *ngx_http_dav_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
-static char *ngx_conf_set_dav_methods(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static char *ngx_conf_set_dav_access(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
+static ngx_conf_bitmask_t ngx_http_dav_methods_mask[] = {
+    { ngx_string("off"), 0 },
+    { ngx_string("OFF"), 0 },
+    { ngx_string("on"), NGX_DAV_METHOD_PUT | NGX_DAV_METHOD_DELETE
+        | NGX_DAV_METHOD_MKCOL | NGX_DAV_METHOD_COPY | NGX_DAV_METHOD_MOVE
+        | NGX_DAV_METHOD_PROPFIND | NGX_DAV_METHOD_PROPPATCH
+        | NGX_DAV_METHOD_OPTIONS | NGX_DAV_METHOD_LOCK | NGX_DAV_METHOD_UNLOCK },
+    { ngx_string("ON"), NGX_DAV_METHOD_PUT | NGX_DAV_METHOD_DELETE
+        | NGX_DAV_METHOD_MKCOL | NGX_DAV_METHOD_COPY | NGX_DAV_METHOD_MOVE
+        | NGX_DAV_METHOD_PROPFIND | NGX_DAV_METHOD_PROPPATCH
+        | NGX_DAV_METHOD_OPTIONS | NGX_DAV_METHOD_LOCK | NGX_DAV_METHOD_UNLOCK },
+    { ngx_string("put"), NGX_DAV_METHOD_PUT },
+    { ngx_string("PUT"), NGX_DAV_METHOD_PUT },
+    { ngx_string("delete"), NGX_DAV_METHOD_DELETE },
+    { ngx_string("DELETE"), NGX_DAV_METHOD_DELETE },
+    { ngx_string("mkcol"), NGX_DAV_METHOD_MKCOL },
+    { ngx_string("MKCOL"), NGX_DAV_METHOD_MKCOL },
+    { ngx_string("copy"), NGX_DAV_METHOD_COPY },
+    { ngx_string("COPY"), NGX_DAV_METHOD_COPY },
+    { ngx_string("move"), NGX_DAV_METHOD_MOVE },
+    { ngx_string("MOVE"), NGX_DAV_METHOD_MOVE },
+    { ngx_string("propfind"), NGX_DAV_METHOD_PROPFIND },
+    { ngx_string("PROPFIND"), NGX_DAV_METHOD_PROPFIND },
+    { ngx_string("proppatch"), NGX_DAV_METHOD_PROPPATCH },
+    { ngx_string("PROPPATCH"), NGX_DAV_METHOD_PROPPATCH },
+    { ngx_string("options"), NGX_DAV_METHOD_OPTIONS },
+    { ngx_string("OPTIONS"), NGX_DAV_METHOD_OPTIONS },
+    { ngx_string("lock"), NGX_DAV_METHOD_LOCK },
+    { ngx_string("LOCK"), NGX_DAV_METHOD_LOCK },
+    { ngx_string("unlock"), NGX_DAV_METHOD_UNLOCK },
+    { ngx_string("UNLOCK"), NGX_DAV_METHOD_UNLOCK },
+    { ngx_null_string, 0 }
+};
 
 static ngx_command_t ngx_http_dav_commands[] = {
         { ngx_string("dav_create_full_path"),
@@ -258,16 +288,16 @@ static ngx_command_t ngx_http_dav_commands[] = {
 
         { ngx_string("dav_methods"),
             NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
-            ngx_conf_set_dav_methods,
+            ngx_conf_set_bitmask_slot,
             NGX_HTTP_LOC_CONF_OFFSET,
-            offsetof(ngx_http_dav_loc_conf_t, dav_methods),
-            NULL },
+            offsetof(ngx_http_dav_loc_conf_t, methods_mask),
+            &ngx_http_dav_methods_mask },
 
         { ngx_string("dav_access"),
-            NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
-            ngx_conf_set_dav_access,
+            NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
+            ngx_conf_set_access_slot,
             NGX_HTTP_LOC_CONF_OFFSET,
-            offsetof(ngx_http_dav_loc_conf_t, dav_access),
+            offsetof(ngx_http_dav_loc_conf_t, access_file_mode),
             NULL },
 
         { ngx_string("dav_delete_depth"),
@@ -296,13 +326,6 @@ static ngx_command_t ngx_http_dav_commands[] = {
             ngx_conf_set_num_slot,
             NGX_HTTP_LOC_CONF_OFFSET,
             offsetof(ngx_http_dav_loc_conf_t, lock_timeout_max),
-            NULL },
-
-        { ngx_string("dav_lock_store"),
-            NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-            ngx_conf_set_str_slot,
-            NGX_HTTP_LOC_CONF_OFFSET,
-            offsetof(ngx_http_dav_loc_conf_t, lock_store_path),
             NULL },
 
         { ngx_string("dav_lock_zone"),
@@ -1057,29 +1080,6 @@ ngx_http_dav_lock_prune_and_sync(ngx_http_request_t *r)
 }
 
 static ngx_int_t
-ngx_http_dav_lock_write_all(int fd, const u_char *data, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = write(fd, data, len);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return NGX_ERROR;
-        }
-
-        if (n == 0) {
-            return NGX_ERROR;
-        }
-
-        data += n;
-        len -= (size_t) n;
-    }
-
-    return NGX_OK;
-}
-
-static ngx_int_t
 ngx_http_dav_lock_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
     ngx_http_dav_lock_zone_ctx_t *octx = data;
@@ -1231,35 +1231,12 @@ ngx_http_dav_lock_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-static u_char *
-ngx_http_dav_lock_store_path_copy(ngx_pool_t *pool, const ngx_str_t *src)
-{
-    u_char *dst, *p;
-
-    if (src == NULL || src->data == NULL || src->len == 0) {
-        return NULL;
-    }
-
-    dst = ngx_pnalloc(pool, src->len + 1);
-    if (dst == NULL) {
-        return NULL;
-    }
-
-    p = ngx_cpymem(dst, src->data, src->len);
-    *p = '\0';
-
-    return dst;
-}
-
 static ngx_int_t
 ngx_http_dav_lock_store_load(ngx_http_request_t *r)
 {
     ngx_http_dav_loc_conf_t *dlcf;
     ngx_array_t             *lock_array;
-    int                      fd;
-    ngx_file_info_t          file_stat;
     u_char                  *file_buf, *file_last, *line, *line_end;
-    u_char                  *store_path;
     ngx_http_dav_lock_zone_ctx_t *zctx;
 
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
@@ -1302,66 +1279,9 @@ ngx_http_dav_lock_store_load(ngx_http_request_t *r)
         file_buf[blob_len] = '\0';
         file_last = file_buf + blob_len;
         ngx_shmtx_unlock(&zctx->shpool->mutex);
-
-        goto parse_blob;
-    }
-
-    if (dlcf->lock_store_path.len == 0 || dlcf->lock_store_path.data == NULL) {
+    } else {
         return NGX_OK;
     }
-
-    store_path = ngx_http_dav_lock_store_path_copy(r->pool, &dlcf->lock_store_path);
-    if (store_path == NULL) {
-        return NGX_ERROR;
-    }
-
-    fd = open((char *) store_path, O_RDONLY);
-    if (fd == -1) {
-        if (errno == ENOENT) {
-            return NGX_OK;
-        }
-        return NGX_ERROR;
-    }
-
-    if (fstat(fd, &file_stat) == -1) {
-        close(fd);
-        return NGX_ERROR;
-    }
-
-    if (file_stat.st_size <= 0) {
-        close(fd);
-        return NGX_OK;
-    }
-
-    file_buf = ngx_pnalloc(r->pool, (size_t) file_stat.st_size + 1);
-    if (file_buf == NULL) {
-        close(fd);
-        return NGX_ERROR;
-    }
-
-    {
-        size_t have = 0;
-        while (have < (size_t) file_stat.st_size) {
-            ssize_t n = read(fd, file_buf + have, (size_t) file_stat.st_size - have);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                close(fd);
-                return NGX_ERROR;
-            }
-            if (n == 0) {
-                break;
-            }
-            have += (size_t) n;
-        }
-        file_buf[have] = '\0';
-        file_last = file_buf + have;
-    }
-
-    close(fd);
-
-parse_blob:
 
     line = file_buf;
     while (line < file_last) {
@@ -1459,10 +1379,6 @@ ngx_http_dav_lock_store_save(ngx_http_request_t *r)
     ngx_http_dav_loc_conf_t *dlcf;
     ngx_http_dav_lock_t     *locks;
     ngx_uint_t               i;
-    int                      lock_fd = -1, tmp_fd = -1;
-    ngx_str_t                lock_path, tmp_path;
-    u_char                  *p, *store_path;
-    u_char                   meta[128];
     ngx_http_dav_lock_zone_ctx_t *zctx;
 
     dlcf = ngx_http_get_module_loc_conf(r, ngx_http_dav_module);
@@ -1470,15 +1386,18 @@ ngx_http_dav_lock_store_save(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
-    if (dlcf->lock_zone != NULL && dlcf->lock_zone->data != NULL) {
+    if (dlcf->lock_zone == NULL || dlcf->lock_zone->data == NULL) {
+        return NGX_OK;
+    }
+    zctx = dlcf->lock_zone->data;
+    if (zctx->shpool == NULL || zctx->sh == NULL) {
+        return NGX_ERROR;
+    }
+
+    {
         size_t cap = 128;
         size_t need = 0;
         u_char *buf, *q;
-
-        zctx = dlcf->lock_zone->data;
-        if (zctx->shpool == NULL || zctx->sh == NULL) {
-            return NGX_ERROR;
-        }
 
         if (ngx_http_dav_locks != NULL && ngx_http_dav_locks->nelts != 0) {
             locks = ngx_http_dav_locks->elts;
@@ -1521,124 +1440,13 @@ ngx_http_dav_lock_store_save(ngx_http_request_t *r)
             ngx_shmtx_unlock(&zctx->shpool->mutex);
             return NGX_ERROR;
         }
-        ngx_memcpy((u_char *) zctx->shpool + zctx->sh->blob_off, buf, (size_t) (q - buf));
+        ngx_memcpy((u_char *) zctx->shpool + zctx->sh->blob_off, buf,
+                   (size_t) (q - buf));
         zctx->sh->blob_len = (size_t) (q - buf);
         ngx_shmtx_unlock(&zctx->shpool->mutex);
-
-        return NGX_OK;
     }
-
-    if (dlcf->lock_store_path.len == 0 || dlcf->lock_store_path.data == NULL) {
-        return NGX_OK;
-    }
-
-    store_path = ngx_http_dav_lock_store_path_copy(r->pool, &dlcf->lock_store_path);
-    if (store_path == NULL) {
-        return NGX_ERROR;
-    }
-
-    lock_path.len = dlcf->lock_store_path.len + sizeof(".lock") - 1;
-    lock_path.data = ngx_pnalloc(r->pool, lock_path.len + 1);
-    if (lock_path.data == NULL) {
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(lock_path.data, store_path, dlcf->lock_store_path.len);
-    p = ngx_cpymem(p, ".lock", sizeof(".lock") - 1);
-    *p = '\0';
-
-    lock_fd = open((char *) lock_path.data, O_CREAT | O_RDWR, 0600);
-    if (lock_fd == -1) {
-        return NGX_ERROR;
-    }
-
-    if (flock(lock_fd, LOCK_EX) == -1) {
-        close(lock_fd);
-        return NGX_ERROR;
-    }
-
-    tmp_path.len = dlcf->lock_store_path.len + sizeof(".tmp") - 1;
-    tmp_path.data = ngx_pnalloc(r->pool, tmp_path.len + 1);
-    if (tmp_path.data == NULL) {
-        flock(lock_fd, LOCK_UN);
-        close(lock_fd);
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(tmp_path.data, store_path, dlcf->lock_store_path.len);
-    p = ngx_cpymem(p, ".tmp", sizeof(".tmp") - 1);
-    *p = '\0';
-
-    tmp_fd = open((char *) tmp_path.data, O_CREAT | O_TRUNC | O_WRONLY, 0600);
-    if (tmp_fd == -1) {
-        flock(lock_fd, LOCK_UN);
-        close(lock_fd);
-        return NGX_ERROR;
-    }
-
-    if (ngx_http_dav_locks != NULL && ngx_http_dav_locks->nelts != 0) {
-        locks = ngx_http_dav_locks->elts;
-
-        for (i = 0; i < ngx_http_dav_locks->nelts; i++) {
-            size_t mlen;
-
-            if (ngx_http_dav_lock_write_all(tmp_fd, locks[i].uri.data,
-                                            locks[i].uri.len) != NGX_OK
-                || ngx_http_dav_lock_write_all(tmp_fd, (u_char *) "\t", 1) != NGX_OK
-                || ngx_http_dav_lock_write_all(tmp_fd, locks[i].token.data,
-                                              locks[i].token.len) != NGX_OK
-                || ngx_http_dav_lock_write_all(tmp_fd, (u_char *) "\t", 1) != NGX_OK)
-            {
-                goto save_failed;
-            }
-
-            mlen = (size_t) (ngx_snprintf(meta, sizeof(meta), "%T\t%ud\t%ud\t",
-                                          locks[i].expires,
-                                          (ngx_uint_t) locks[i].depth_infinity,
-                                          (ngx_uint_t) locks[i].exclusive) - meta);
-
-            if (ngx_http_dav_lock_write_all(tmp_fd, meta, mlen) != NGX_OK) {
-                goto save_failed;
-            }
-
-            if (locks[i].owner.len == 0 || locks[i].owner.data == NULL) {
-                if (ngx_http_dav_lock_write_all(tmp_fd, (u_char *) "-\n", 2) != NGX_OK) {
-                    goto save_failed;
-                }
-            } else {
-                if (ngx_http_dav_lock_write_all(tmp_fd, locks[i].owner.data,
-                                                locks[i].owner.len) != NGX_OK
-                    || ngx_http_dav_lock_write_all(tmp_fd, (u_char *) "\n", 1) != NGX_OK)
-                {
-                    goto save_failed;
-                }
-            }
-        }
-    }
-
-    (void) fsync(tmp_fd);
-    close(tmp_fd);
-    tmp_fd = -1;
-
-    if (rename((char *) tmp_path.data, (char *) store_path) != 0) {
-        flock(lock_fd, LOCK_UN);
-        close(lock_fd);
-        return NGX_ERROR;
-    }
-
-    flock(lock_fd, LOCK_UN);
-    close(lock_fd);
 
     return NGX_OK;
-
-save_failed:
-
-    if (tmp_fd != -1) {
-        close(tmp_fd);
-    }
-
-    flock(lock_fd, LOCK_UN);
-    close(lock_fd);
-
-    return NGX_ERROR;
 }
 
 static ngx_int_t
@@ -2105,7 +1913,13 @@ ngx_http_dav_lock_build_discovery_xml(ngx_http_request_t *r, const ngx_str_t *ur
     }
 
     locks = ngx_http_dav_locks->elts;
-    cap = sizeof("<D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:timeout>Second-999999</D:timeout><D:locktoken><D:href></D:href></D:locktoken></D:activelock></D:lockdiscovery>") - 1
+    cap = sizeof("<D:lockdiscovery><D:activelock>"
+                 "<D:locktype><D:write/></D:locktype>"
+                 "<D:lockscope><D:exclusive/></D:lockscope>"
+                 "<D:depth>infinity</D:depth>"
+                 "<D:timeout>Second-999999</D:timeout>"
+                 "<D:locktoken><D:href></D:href></D:locktoken>"
+                 "</D:activelock></D:lockdiscovery>") - 1
             + locks[idx].token.len + locks[idx].owner.len + 96;
 
     buf = ngx_pnalloc(r->pool, cap);
@@ -2500,29 +2314,6 @@ ngx_http_dav_sync_dead_props_tree(ngx_http_request_t *r, const char *src,
 }
 
 static void
-ngx_http_dav_prune_props_dirs(ngx_http_request_t *r, ngx_str_t *ppath)
-{
-    u_char *dir, *p, *slash;
-    size_t len;
-
-    dir = ngx_pnalloc(r->pool, ppath->len + 1);
-    if (dir == NULL) {
-        return;
-    }
-
-    p = ngx_cpymem(dir, ppath->data, ppath->len);
-    *p = '\0';
-
-    slash = p;
-    while (slash > dir && *(slash - 1) != '/') {
-        slash--;
-    }
-    if (slash == dir) {
-        return;
-    }
-
-    *(slash - 1) = '\0';
-    len = (size_t) ((slash - 1) - dir);
 
     while (len > 0) {
         u_char *base = dir + len;
@@ -4089,7 +3880,11 @@ ngx_http_dav_propfind_emit_children(ngx_http_request_t *r,
                 if (preq->mode == NGX_DAV_PROPFIND_PROPNAME) {
                     NGX_DAV_XML_APPEND_LIT2("<D:supportedlock/>\n");
                 } else {
-                    NGX_DAV_XML_APPEND_LIT2("<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>\n");
+                    NGX_DAV_XML_APPEND_LIT2(
+                        "<D:supportedlock><D:lockentry>"
+                        "<D:lockscope><D:exclusive/></D:lockscope>"
+                        "<D:locktype><D:write/></D:locktype>"
+                        "</D:lockentry></D:supportedlock>\n");
                 }
             }
 
@@ -5277,7 +5072,15 @@ ngx_http_dav_lock_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    xml_cap = sizeof("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:timeout>Second-999999</D:timeout><D:owner>litmus test suite</D:owner><D:locktoken><D:href></D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>\n") - 1
+    xml_cap = sizeof("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                     "<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>"
+                     "<D:locktype><D:write/></D:locktype>"
+                     "<D:lockscope><D:exclusive/></D:lockscope>"
+                     "<D:depth>infinity</D:depth>"
+                     "<D:timeout>Second-999999</D:timeout>"
+                     "<D:owner>litmus test suite</D:owner>"
+                     "<D:locktoken><D:href></D:href></D:locktoken>"
+                     "</D:activelock></D:lockdiscovery></D:prop>\n") - 1
               + token.len + 64;
     xml = ngx_pnalloc(r->pool, xml_cap);
     if (xml == NULL) {
@@ -6000,7 +5803,11 @@ ngx_http_dav_propfind_handler(ngx_http_request_t *r)
             if (preq.mode == NGX_DAV_PROPFIND_PROPNAME) {
                 NGX_DAV_XML_APPEND_LIT("<D:supportedlock/>\n");
             } else {
-                NGX_DAV_XML_APPEND_LIT("<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>\n");
+                NGX_DAV_XML_APPEND_LIT(
+                    "<D:supportedlock><D:lockentry>"
+                    "<D:lockscope><D:exclusive/></D:lockscope>"
+                    "<D:locktype><D:write/></D:locktype>"
+                    "</D:lockentry></D:supportedlock>\n");
             }
         }
 
@@ -6626,8 +6433,20 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
             tmp_path[dst.len + sizeof(".davXXXXXX") - 1] = '\0';
 
             int outfd = mkstemp(tmp_path);
-            if (outfd == -1) { close(infd); if (ngx_errno == EACCES || ngx_errno == EPERM) return NGX_HTTP_FORBIDDEN; return NGX_HTTP_INTERNAL_SERVER_ERROR; }
-            if (fchmod(outfd, dlcf->access_file_mode) == -1) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            if (outfd == -1) {
+                close(infd);
+                if (ngx_errno == EACCES || ngx_errno == EPERM) {
+                    return NGX_HTTP_FORBIDDEN;
+                }
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            if (fchmod(outfd, dlcf->access_file_mode) == -1) {
+                close(infd);
+                close(outfd);
+                ngx_delete_file(tmp_path);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
 
             ssize_t nread;
             char buf[8192];
@@ -6640,7 +6459,12 @@ ngx_http_dav_move_handler(ngx_http_request_t *r)
                 }
                 if (nw <= 0) break;
             }
-            if (nread < 0) { close(infd); close(outfd); ngx_delete_file(tmp_path); return NGX_HTTP_INTERNAL_SERVER_ERROR; }
+            if (nread < 0) {
+                close(infd);
+                close(outfd);
+                ngx_delete_file(tmp_path);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
             fsync(outfd); close(outfd); close(infd);
 
             if (rename(tmp_path, (char *) dst.data) != 0) {
@@ -6961,8 +6785,6 @@ ngx_http_dav_create_loc_conf(ngx_conf_t *cf)
     }
 
     conf->create_full_path = NGX_CONF_UNSET;
-    conf->dav_methods = NGX_CONF_UNSET_PTR;
-    conf->dav_access = NGX_CONF_UNSET_PTR;
     conf->min_delete_depth = NGX_CONF_UNSET_UINT;
     conf->methods_mask = NGX_CONF_UNSET_UINT;
     conf->access_file_mode = NGX_CONF_UNSET_UINT;
@@ -6971,8 +6793,6 @@ ngx_http_dav_create_loc_conf(ngx_conf_t *cf)
     conf->lock_timeout_min = NGX_CONF_UNSET_UINT;
     conf->lock_timeout_max = NGX_CONF_UNSET_UINT;
     conf->lock_zone_timeout = NGX_CONF_UNSET_UINT;
-    conf->lock_store_path.len = 0;
-    conf->lock_store_path.data = NULL;
     conf->lock_zone = NULL;
 
     return conf;
@@ -6987,13 +6807,12 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->create_full_path, prev->create_full_path, 0);
     ngx_conf_merge_uint_value(conf->min_delete_depth, prev->min_delete_depth, 0);
     ngx_conf_merge_uint_value(conf->access_file_mode, prev->access_file_mode, 0600);
-    ngx_conf_merge_uint_value(conf->access_dir_mode, prev->access_dir_mode, 0700);
+    conf->access_dir_mode = ngx_dir_access(conf->access_file_mode);
     ngx_conf_merge_uint_value(conf->lock_max_entries, prev->lock_max_entries, 10000);
     ngx_conf_merge_uint_value(conf->lock_timeout_min, prev->lock_timeout_min, 30);
     ngx_conf_merge_uint_value(conf->lock_timeout_max, prev->lock_timeout_max, 3600);
     ngx_conf_merge_uint_value(conf->lock_zone_timeout, prev->lock_zone_timeout,
                               NGX_DAV_LOCK_DEFAULT_TIMEOUT);
-    ngx_conf_merge_str_value(conf->lock_store_path, prev->lock_store_path, "");
 
     if (conf->lock_zone == NULL) {
         conf->lock_zone = prev->lock_zone;
@@ -7005,22 +6824,6 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->lock_timeout_max < conf->lock_timeout_min) {
         conf->lock_timeout_max = conf->lock_timeout_min;
-    }
-
-    if (conf->dav_methods == NGX_CONF_UNSET_PTR) {
-        if (prev->dav_methods != NGX_CONF_UNSET_PTR) {
-            conf->dav_methods = prev->dav_methods;
-        } else {
-            conf->dav_methods = NULL;
-        }
-    }
-
-    if (conf->dav_access == NGX_CONF_UNSET_PTR) {
-        if (prev->dav_access != NGX_CONF_UNSET_PTR) {
-            conf->dav_access = prev->dav_access;
-        } else {
-            conf->dav_access = NULL;
-        }
     }
 
     ngx_conf_merge_uint_value(conf->methods_mask, prev->methods_mask, 0);
@@ -7056,171 +6859,6 @@ ngx_http_dav_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     /* keep merge phase quiet in production */
-
-    return NGX_CONF_OK;
-}
-
-static char *
-ngx_conf_set_dav_access(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
-{
-    ngx_http_dav_loc_conf_t *dlcf = conf;
-
-    if (dlcf->dav_access != NGX_CONF_UNSET_PTR) {
-        return "is duplicate";
-    }
-
-    ngx_str_t *value = cf->args->elts;
-    dlcf->dav_access = ngx_array_create(cf->pool, cf->args->nelts - 1, sizeof(ngx_str_t));
-    if (dlcf->dav_access == NULL) {
-        return NGX_CONF_ERROR;
-    }
-
-    ngx_uint_t file_mode = 0;
-    ngx_uint_t dir_mode = 0;
-
-    ngx_uint_t i;
-    for (i = 1; i < cf->args->nelts; i++) {
-        ngx_str_t *entry = &value[i];
-        ngx_str_t *dst = ngx_array_push(dlcf->dav_access);
-        if (dst == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        *dst = *entry;
-
-        u_char *p = (u_char *) ngx_strlchr(entry->data, entry->data + entry->len, ':');
-        if (p == NULL) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid dav_access token \"%V\"", entry);
-            return NGX_CONF_ERROR;
-        }
-
-        ngx_str_t who;
-        who.data = entry->data;
-        who.len = p - entry->data;
-
-        ngx_str_t perm;
-        perm.data = p + 1;
-        perm.len = entry->len - who.len - 1;
-
-        ngx_uint_t scope = 0;
-        if ((who.len == 4 && ngx_strncasecmp(who.data, (u_char *) "user", 4) == 0)
-            || (who.len == 1 && (who.data[0] == 'u' || who.data[0] == 'U')))
-        {
-            scope = 1;
-        } else if ((who.len == 5 && ngx_strncasecmp(who.data, (u_char *) "group", 5) == 0)
-                   || (who.len == 1 && (who.data[0] == 'g' || who.data[0] == 'G')))
-        {
-            scope = 2;
-        } else if ((who.len == 3 && ngx_strncasecmp(who.data, (u_char *) "all", 3) == 0)
-                   || (who.len == 5 && ngx_strncasecmp(who.data, (u_char *) "other", 5) == 0)
-                   || (who.len == 1 && (who.data[0] == 'o' || who.data[0] == 'O')))
-        {
-            scope = 4;
-        } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid dav_access subject \"%V\"", &who);
-            return NGX_CONF_ERROR;
-        }
-
-        ngx_uint_t r = 0, w = 0, x = 0;
-        ngx_uint_t j;
-        for (j = 0; j < perm.len; j++) {
-            u_char c = perm.data[j];
-            if (c == 'r' || c == 'R') {
-                r = 1;
-            } else if (c == 'w' || c == 'W') {
-                w = 1;
-            } else if (c == 'x' || c == 'X') {
-                x = 1;
-            } else {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "invalid dav_access permission \"%V\"", &perm);
-                return NGX_CONF_ERROR;
-            }
-        }
-
-        if (scope & 1) {
-            if (r) { file_mode |= S_IRUSR; dir_mode |= S_IRUSR; }
-            if (w) { file_mode |= S_IWUSR; dir_mode |= S_IWUSR; }
-            if (x || r || w) { dir_mode |= S_IXUSR; }
-        }
-        if (scope & 2) {
-            if (r) { file_mode |= S_IRGRP; dir_mode |= S_IRGRP; }
-            if (w) { file_mode |= S_IWGRP; dir_mode |= S_IWGRP; }
-            if (x || r || w) { dir_mode |= S_IXGRP; }
-        }
-        if (scope & 4) {
-            if (r) { file_mode |= S_IROTH; dir_mode |= S_IROTH; }
-            if (w) { file_mode |= S_IWOTH; dir_mode |= S_IWOTH; }
-            if (x || r || w) { dir_mode |= S_IXOTH; }
-        }
-    }
-
-    dlcf->access_file_mode = file_mode;
-    dlcf->access_dir_mode = dir_mode;
-
-    return NGX_CONF_OK;
-}
-
-static char *
-ngx_conf_set_dav_methods(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
-{
-    ngx_http_dav_loc_conf_t *dlcf = conf;
-
-    if (dlcf->methods_mask != NGX_CONF_UNSET_UINT) {
-        return "is duplicate";
-    }
-
-    ngx_str_t *value = cf->args->elts;
-
-    dlcf->dav_methods = ngx_array_create(cf->pool, cf->args->nelts - 1, sizeof(ngx_str_t));
-    if (dlcf->dav_methods == NULL) {
-        return NGX_CONF_ERROR;
-    }
-
-    dlcf->methods_mask = 0;
-
-    ngx_uint_t i;
-    for (i = 1; i < cf->args->nelts; i++) {
-        ngx_str_t *m = &value[i];
-        ngx_str_t *dst = ngx_array_push(dlcf->dav_methods);
-        if (dst == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        *dst = *m;
-
-        if (m->len == 3 && ngx_strncasecmp(m->data, (u_char *)"off", 3) == 0) {
-            if (cf->args->nelts != 2) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "dav_methods \"off\" cannot be mixed with other methods");
-                return NGX_CONF_ERROR;
-            }
-            dlcf->methods_mask = 0;
-        } else if (m->len == 3 && ngx_strncasecmp(m->data, (u_char *)"PUT", 3) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_PUT;
-        } else if (m->len == 6 && ngx_strncasecmp(m->data, (u_char *)"DELETE", 6) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_DELETE;
-        } else if (m->len == 5 && ngx_strncasecmp(m->data, (u_char *)"MKCOL", 5) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_MKCOL;
-        } else if (m->len == 8 && ngx_strncasecmp(m->data, (u_char *)"PROPFIND", 8) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_PROPFIND;
-        } else if (m->len == 9 && ngx_strncasecmp(m->data, (u_char *)"PROPPATCH", 9) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_PROPPATCH;
-        } else if (m->len == 7 && ngx_strncasecmp(m->data, (u_char *)"OPTIONS", 7) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_OPTIONS;
-        } else if (m->len == 4 && ngx_strncasecmp(m->data, (u_char *)"COPY", 4) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_COPY;
-        } else if (m->len == 4 && ngx_strncasecmp(m->data, (u_char *)"MOVE", 4) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_MOVE;
-        } else if (m->len == 4 && ngx_strncasecmp(m->data, (u_char *)"LOCK", 4) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_LOCK;
-        } else if (m->len == 6 && ngx_strncasecmp(m->data, (u_char *)"UNLOCK", 6) == 0) {
-            dlcf->methods_mask |= NGX_DAV_METHOD_UNLOCK;
-        } else {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid dav_methods token \"%V\"", m);
-            return NGX_CONF_ERROR;
-        }
-    }
 
     return NGX_CONF_OK;
 }
