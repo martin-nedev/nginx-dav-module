@@ -1,12 +1,8 @@
-
-
-## ngx_dav_module
-
+A WebDAV module for nginx.
 
 ## About
 
-/* WebDAV module for nginx
-   Written by Martin Nedev, 2026 */
+A WebDAV module for nginx.
 
 Implemented methods: PUT, DELETE, MKCOL, COPY, MOVE, PROPFIND, PROPPATCH, OPTIONS, LOCK, UNLOCK.
 
