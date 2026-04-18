@@ -1,4 +1,4 @@
-A WebDAV module for nginx.
+## nginx-dav-module
 
 ## About
 
