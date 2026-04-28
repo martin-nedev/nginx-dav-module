@@ -1,4 +1,4 @@
-## nginx-dav-module
+## nginx-dav-std-module
 
 ## About
 
@@ -16,19 +16,19 @@ This module replaces the standard ngx_http_dav_module and is not compatible with
 
 # replacement
 
-copy ngx_http_dav_module.c into nginx/src/http/modules/ (replace the existing file).
+copy ngx_http_dav_std_module.c to nginx/src/http/modules/ngx_http_dav_module.c (replace the existing file).
 
 ./configure --with-http_dav_module.
 
 # static module
 
-./configure --add-module=/path/to/nginx-dav-module
+./configure --add-module=/path/to/nginx-dav-std-module
 
 nginx must not be configured with --with-http_dav_module.
 
 # dynamic module
 
-./configure --add-dynamic-module=/path/to/nginx-dav-module
+./configure --add-dynamic-module=/path/to/nginx-dav-std-module
 
 nginx must not be configured with --with-http_dav_module.
 
